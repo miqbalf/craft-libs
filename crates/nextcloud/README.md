@@ -19,16 +19,38 @@ borrowed from a later `PROPFIND`.
 
 ## Not verified
 
-`search` and `shared_with_me` are tested against in-memory fakes only; neither has been run
-against a live Nextcloud. The `SEARCH` body follows Nextcloud's documented `d:basicsearch`, and the
-share fields follow the OCS sharing API, so check both on a real server before relying on them.
-`search` puts the text into `d:like` as written. The escape behaviour of `d:like` is not
-confirmed and was not researched, so none is sent: `%` and `_` in the search text may act as
-wildcards and a search for `50%` may over-match. `Entry::lock` comes from `nc:lock`,
-`nc:lock-owner`, `nc:lock-owner-displayname` and `nc:lock-owner-type` (1 means an app lock, per
-Nextcloud's published WebDAV documentation); not checked against a live server. `shared_with_me`
-keeps the first of several shares of one path and makes it writable if any of them is.
-Paths from `shared_with_me` carry a leading slash, as `list` and `search` paths do.
+Nothing in this crate has run against a live Nextcloud yet. Every test runs against in-memory
+fakes that answer the way the public documentation says a server does. In particular, none of
+these has been checked on a real server:
+
+- **Login Flow v2**: `LoginFlow::start` and `poll`, including 404 as "not yet".
+- **PROPFIND**: the listing body, the properties returned, and absolute-URI versus path hrefs.
+- **PUT and `OC-ETag`**: that the PUT response carries the new ETag, as `OC-ETag` or `ETag`.
+- **LOCK, refresh and UNLOCK**: the `Lock-Token` and `Timeout` response headers, the refresh
+  request, and the `If: (<token>)` header that a lock-aware `put` sends.
+- **`capabilities().locking`**: whether `files.locking` is the right capability to read.
+- **`search`**: the `SEARCH` body follows Nextcloud's documented `d:basicsearch`. The text goes
+  into `d:like` as written. The escape behaviour of `d:like` is not confirmed and was not
+  researched, so none is sent: `%` and `_` in the search text may act as wildcards, and a
+  search for `50%` may over-match.
+- **`shared_with_me`**: the share fields follow the OCS sharing API. It keeps the first of
+  several shares of one path, and makes it writable if any of them is. Its paths carry a leading
+  slash, as `list` and `search` paths do.
+- **The lock-holder props**: `Entry::lock` comes from `nc:lock`, `nc:lock-owner`,
+  `nc:lock-owner-displayname` and `nc:lock-owner-type`. The owner-type values are 0 for a user,
+  1 for an app (Office or Text) and 2 for WebDAV, per Nextcloud's developer manual,
+  <https://docs.nextcloud.com/server/stable/developer_manual/client_apis/WebDAV/basic.html>.
+
+## Size limits
+
+Every request tells the transport the most body bytes the crate will take, in
+`Request::max_body`. A transport should stop reading past it, and the crate checks the length
+again after the response arrives. The limits are:
+
+- `get`: the caller's `max_bytes`.
+- Listings (`list`, `search`, `shared_with_me`): 64 MiB, and at most 4,000,000 XML nodes. That
+  is well over 100,000 entries.
+- Login Flow, `capabilities`, and the responses to writes and locks: 1 MiB.
 
 ## Multistatus parsing
 

@@ -87,7 +87,8 @@ pub struct Entry {
 /// Who holds an editing lock.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockHolder {
-    /// The holder's account id, when the provider gives one. Absent for an app lock.
+    /// The holder's account id, when the provider gives one. An app lock may carry one too: the
+    /// account the app holds the lock for.
     pub id: Option<String>,
     /// What to show. A display name where there is one.
     pub name: Option<String>,
