@@ -7,7 +7,8 @@ code path serves a native app and a WebAssembly build.
 - `login::LoginFlow` signs in through the browser and yields an `AppPassword`. The password is a
   `Secret`, whose `Debug` never prints it.
 - `dav::Files` lists (`craft_cloud::Entry`), reads (with a size cap and the ETag), writes, creates,
-  locks, refreshes and unlocks, and reports whether the server offers locking.
+  locks, refreshes and unlocks, searches by name (`search`, a WebDAV `SEARCH`), lists what others
+  shared with the user (`shared_with_me`, OCS), and reports whether the server offers locking.
 - `Error` has `Conflict` (412), `Locked` (423), `Unauthorized` (401), `NotFound` (404),
   `Transport`, `Malformed`, and `Status` for any other answer.
 
@@ -15,6 +16,13 @@ Two behaviours matter to a document app. `create` sends `If-None-Match: *`, so a
 taken is a `Conflict`, not a silent overwrite. `put` returns the ETag of the write itself, read
 from the PUT response, and is `Malformed("no etag")` when the server sends none, never an ETag
 borrowed from a later `PROPFIND`.
+
+## Not verified
+
+`search` and `shared_with_me` are tested against in-memory fakes only; neither has been run
+against a live Nextcloud. The `SEARCH` body follows Nextcloud's documented `d:basicsearch`, and the
+share fields follow the OCS sharing API, so check both on a real server before relying on them.
+A shared entry's `path` has no leading slash, unlike `list` and `search`.
 
 ## Multistatus parsing
 

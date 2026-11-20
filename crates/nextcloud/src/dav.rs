@@ -15,14 +15,11 @@ use craft_dav::{href, parse_multistatus, properties, responses};
 
 use crate::error::{Error, Result};
 use crate::http::{Http, Method, Response};
-use crate::{Account, encode_path, send, send_unbounded};
+use crate::{Account, encode_path, encode_segment, send, send_unbounded};
 
 /// The properties asked for. A small set keeps the answer small on a folder with thousands of
 /// entries.
-const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
-  <d:prop>
-    <d:resourcetype/>
+const PROPS: &str = r#"    <d:resourcetype/>
     <d:getcontentlength/>
     <d:getcontenttype/>
     <d:getlastmodified/>
@@ -31,9 +28,54 @@ const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <oc:permissions/>
     <oc:owner-id/>
     <nc:lock/>
-    <nc:lock-owner/>
+    <nc:lock-owner/>"#;
+
+/// The `PROPFIND` request body, asking for [`PROPS`].
+fn propfind_body() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:prop>
+{PROPS}
   </d:prop>
-</d:propfind>"#;
+</d:propfind>"#
+    )
+}
+
+/// How many results a search asks for.
+const SEARCH_LIMIT: u32 = 200;
+
+/// The `SEARCH` request body: files of `user_segment` (already percent-encoded) whose display
+/// name contains `text` (already XML-escaped), asking for [`PROPS`].
+fn search_body(user_segment: &str, text: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:basicsearch>
+    <d:select>
+      <d:prop>
+{PROPS}
+      </d:prop>
+    </d:select>
+    <d:from>
+      <d:scope>
+        <d:href>/files/{user_segment}</d:href>
+        <d:depth>infinity</d:depth>
+      </d:scope>
+    </d:from>
+    <d:where>
+      <d:like>
+        <d:prop><d:displayname/></d:prop>
+        <d:literal>%{text}%</d:literal>
+      </d:like>
+    </d:where>
+    <d:limit>
+      <d:nresults>{SEARCH_LIMIT}</d:nresults>
+    </d:limit>
+  </d:basicsearch>
+</d:searchrequest>"#
+    )
+}
 
 /// A held WebDAV lock, as returned by [`Files::lock`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,17 +124,60 @@ impl<'a> Files<'a> {
             .header("depth", "1")
             .header("content-type", "application/xml; charset=utf-8")
             .header("accept", "application/xml")
-            .body(PROPFIND_BODY.as_bytes().to_vec());
+            .body(propfind_body().into_bytes());
         let resp = send(http, req)?;
 
+        let own = decode(&href_path(&url));
+        self.entries(&resp, Some(own.trim_end_matches('/')))
+    }
+
+    /// Search the user's files by display name. Blank `text` returns nothing without a request.
+    ///
+    /// A `SEARCH` on the DAV root, `d:like` on `d:displayname` with `%text%`, from the user's
+    /// files at any depth, at most 200 results. Entries are as [`Files::list`] gives them.
+    pub fn search<H: Http>(&self, http: &H, text: &str) -> Result<Vec<Entry>> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = search_body(&encode_segment(self.account.user()), &craft_xml::esc(text));
+        let req = self
+            .account
+            .request(Method::Search, format!("{}/remote.php/dav/", self.account.base()))
+            .header("content-type", "text/xml")
+            .header("accept", "application/xml")
+            .body(body.into_bytes());
+        let resp = send(http, req)?;
+        self.entries(&resp, None)
+    }
+
+    /// Items other people shared with this user, from the OCS sharing API. Paths are the ones in
+    /// this user's own files, without the leading slash.
+    pub fn shared_with_me<H: Http>(&self, http: &H) -> Result<Vec<Entry>> {
+        let url = format!("{}/ocs/v2.php/apps/files_sharing/api/v1/shares?shared_with_me=true&format=json", self.account.base());
+        let req = self.account.request(Method::Get, url).header("accept", "application/json");
+        let resp = send(http, req)?;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| Error::malformed(format!("shares: {e}")))?;
+        match v.pointer("/ocs/meta/statuscode").and_then(serde_json::Value::as_i64) {
+            Some(100 | 200) => {}
+            Some(code) => return Err(Error::malformed(format!("shares: OCS status {code}"))),
+            None => return Err(Error::malformed("shares: no OCS status")),
+        }
+        let data = v.pointer("/ocs/data").and_then(serde_json::Value::as_array).ok_or_else(|| Error::malformed("shares: data is not a list"))?;
+        Ok(data.iter().filter_map(share_entry).collect())
+    }
+
+    /// Entries of a multistatus, skipping the entry whose decoded path is `skip` and, for any
+    /// answer, the files root itself.
+    fn entries(&self, resp: &Response, skip: Option<&str>) -> Result<Vec<Entry>> {
         let root = parse_multistatus(&resp.body).map_err(|e| Error::malformed(e.to_string()))?;
         let files_root = decode(&href_path(&self.account.files_root()));
-        let own = decode(&href_path(&url));
-        let own = own.trim_end_matches('/');
         let mut out = Vec::new();
         for response in responses(&root) {
             let Some(h) = href(response) else { continue };
-            if decode(&h).trim_end_matches('/') == own {
+            let decoded = decode(&h);
+            let trimmed = decoded.trim_end_matches('/');
+            if skip.is_some_and(|own| trimmed == own) || trimmed == files_root {
                 continue;
             }
             out.push(entry_from(response, &h, &files_root));
@@ -206,6 +291,39 @@ impl<'a> Files<'a> {
         };
         Ok(Capabilities { locking })
     }
+}
+
+/// Build an [`Entry`] from one OCS share object, or `None` when it has no path.
+///
+/// OCS permissions are a bitmask: 2 is update, 4 create. A share that omits them is read-only.
+fn share_entry(share: &serde_json::Value) -> Option<Entry> {
+    let path = share.get("path")?.as_str()?.trim_start_matches('/').to_owned();
+    if path.is_empty() {
+        return None;
+    }
+    let text = |key: &str| share.get(key).and_then(serde_json::Value::as_str).map(str::to_owned).filter(|t| !t.is_empty());
+    let number = |key: &str| share.get(key).and_then(serde_json::Value::as_i64);
+    let is_dir = share.get("item_type").and_then(serde_json::Value::as_str) == Some("folder");
+    let modified =
+        number("item_mtime").or_else(|| number("stime")).and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)).map(|d| d.to_rfc3339());
+    let writable = number("permissions").is_some_and(|p| p & if is_dir { 2 | 4 } else { 2 } != 0);
+    let room = share
+        .get("item_source")
+        .and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.as_i64().map(|n| n.to_string())))
+        .unwrap_or_else(|| path.clone());
+    Some(Entry {
+        id: path.clone(),
+        room,
+        name: path.rsplit('/').next().unwrap_or_default().to_owned(),
+        path,
+        kind: if is_dir { EntryKind::Folder } else { EntryKind::File },
+        size: if is_dir { None } else { share.get("item_size").and_then(serde_json::Value::as_u64) },
+        modified,
+        mime: text("mimetype"),
+        etag: None,
+        writable,
+        shared_by: text("uid_owner").or_else(|| text("displayname_owner")),
+    })
 }
 
 /// Build an [`Entry`] from one `response`. Every property is optional.

@@ -227,10 +227,138 @@ fn hostile_multistatus_is_malformed() {
         b"<d:multistatus xmlns:d=\"DAV:\"><d:response>".to_vec(),
     ];
     for body in bodies {
-        let http = Fake::new(vec![Response::new(207, body)]);
+        let http = Fake::new(vec![Response::new(207, body.clone())]);
         let err = Files::new(&account()).list(&http, "/").unwrap_err();
         assert!(matches!(err, Error::Malformed(_)), "{err:?}");
+        // A SEARCH answer goes through the same parser.
+        let http = Fake::new(vec![Response::new(207, body)]);
+        let err = Files::new(&account()).search(&http, "x").unwrap_err();
+        assert!(matches!(err, Error::Malformed(_)), "{err:?}");
     }
+}
+
+#[test]
+fn hostile_ocs_body_is_malformed() {
+    let bodies: Vec<Vec<u8>> = vec![
+        br#"{"ocs":{"meta":{"statuscode":200},"data":[{"path":"/a""#.to_vec(),
+        b"<html>not json</html>".to_vec(),
+        br#"{"ocs":{"meta":{"statuscode":200},"data":"nope"}}"#.to_vec(),
+        br#"{"ocs":{"data":[]}}"#.to_vec(),
+        br#"{"ocs":{"meta":{"statuscode":403},"data":[]}}"#.to_vec(),
+        vec![b'{', 0xff, 0xfe],
+    ];
+    for body in bodies {
+        let http = Fake::new(vec![Response::new(200, body)]);
+        let err = Files::new(&account()).shared_with_me(&http).unwrap_err();
+        assert!(matches!(err, Error::Malformed(_)), "{err:?}");
+    }
+}
+
+fn body_text(req: &Request) -> String {
+    String::from_utf8_lossy(&req.body).into_owned()
+}
+
+#[test]
+fn search_sends_basicsearch_scoped_to_user_files() {
+    let acct = Account::new("https://cloud.example.net/", "alice smith", "pw-secret");
+    let http = Fake::new(vec![multistatus("")]);
+    Files::new(&acct).search(&http, "report").unwrap();
+    let req = &http.requests()[0];
+    assert_eq!(req.method, Method::Search);
+    assert!(req.url.ends_with("/remote.php/dav/"), "{}", req.url);
+    assert_eq!(req.get_header("content-type"), Some("text/xml"));
+    let body = body_text(req);
+    assert!(body.contains("d:basicsearch") && body.contains("d:like"));
+    assert!(body.contains("%report%"), "{body}");
+    // The scope carries the encoded user name, never the raw space.
+    assert!(body.contains(&format!("/files/{}", craft_nextcloud::encode_segment("alice smith"))), "{body}");
+    assert!(!body.contains("alice smith"));
+    // The same properties `list` asks for.
+    for prop in ["d:getetag", "oc:fileid", "oc:permissions", "oc:owner-id"] {
+        assert!(body.contains(prop), "{prop}");
+    }
+}
+
+#[test]
+fn search_maps_results_like_list() {
+    let folder = item("/remote.php/dav/files/u/Docs/Plans/", "<d:resourcetype><d:collection/></d:resourcetype>");
+    let file = item(
+        "/remote.php/dav/files/u/Docs/Plans/plan%20b.docx",
+        "<d:resourcetype/><d:getcontentlength>9</d:getcontentlength><d:getetag>\"e2\"</d:getetag>",
+    );
+    let listing = Fake::new(vec![multistatus(&format!("{folder}{file}"))]);
+    let searched = Fake::new(vec![multistatus(&format!("{folder}{file}"))]);
+    let acct = account();
+    let files = Files::new(&acct);
+    let found = files.search(&searched, "plan").unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!((found[0].path.as_str(), found[0].kind), ("/Docs/Plans", craft_cloud::EntryKind::Folder));
+    assert_eq!((found[1].path.as_str(), found[1].name.as_str()), ("/Docs/Plans/plan b.docx", "plan b.docx"));
+    assert_eq!(found[1].size, Some(9));
+    // Parsed exactly as a listing of the parent would parse the same responses.
+    let listed = files.list(&listing, "/Docs/Plans").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0], found[1]);
+}
+
+#[test]
+fn search_escapes_xml_in_text() {
+    let text = "a<b&\"c";
+    let http = Fake::new(vec![multistatus("")]);
+    Files::new(&account()).search(&http, text).unwrap();
+    let body = body_text(&http.requests()[0]);
+    assert!(body.contains(&format!("%{}%", craft_xml::esc(text))), "{body}");
+    assert!(!body.contains("a<b"), "{body}");
+}
+
+#[test]
+fn blank_search_sends_nothing() {
+    for text in ["", "   ", "\t\n"] {
+        let http = Fake::new(Vec::new());
+        assert!(Files::new(&account()).search(&http, text).unwrap().is_empty());
+        assert!(http.requests().is_empty());
+    }
+}
+
+const SHARES: &str = r#"{"ocs":{"meta":{"status":"ok","statuscode":200},"data":[
+  {"id":"1","item_type":"file","path":"/Shared/report.docx","uid_owner":"bob","displayname_owner":"Bob B","mimetype":"application/vnd.openxmlformats-officedocument.wordprocessingml.document","item_size":1234,"stime":1700000000,"item_mtime":1700000500,"item_source":4711,"permissions":19},
+  {"id":"2","item_type":"folder","path":"/Shared/Team","uid_owner":"carol","displayname_owner":"Carol","mimetype":"httpd/unix-directory","permissions":1}
+]}}"#;
+
+#[test]
+fn shared_with_me_maps_ocs_shares() {
+    let http = Fake::new(vec![Response::new(200, SHARES)]);
+    let entries = Files::new(&account()).shared_with_me(&http).unwrap();
+    let req = &http.requests()[0];
+    assert_eq!(req.method, Method::Get);
+    assert!(req.url.contains("/ocs/v2.php/apps/files_sharing/api/v1/shares"), "{}", req.url);
+    assert!(req.url.contains("shared_with_me=true") && req.url.contains("format=json"));
+    assert_eq!(req.get_header("ocs-apirequest"), Some("true"));
+
+    assert_eq!(entries.len(), 2);
+    let (file, folder) = (&entries[0], &entries[1]);
+    assert_eq!(file.path, "Shared/report.docx");
+    assert_eq!(file.name, "report.docx");
+    assert_eq!(file.kind, craft_cloud::EntryKind::File);
+    assert_eq!(folder.kind, craft_cloud::EntryKind::Folder);
+    assert_eq!(folder.name, "Team");
+    assert_eq!(file.shared_by.as_deref(), Some("bob"));
+    assert_eq!(folder.shared_by.as_deref(), Some("carol"));
+    assert_eq!(file.size, Some(1234));
+    assert_eq!(folder.size, None);
+    assert!(file.mime.as_deref().is_some_and(|m| m.contains("wordprocessingml")));
+    assert!(file.modified.as_deref().is_some_and(|m| m.starts_with("2023-11-14T")));
+    // Read-only share versus one that may be updated.
+    assert!(file.writable && !folder.writable);
+    // The room is stable across a rename, so it is the file id, not the path.
+    assert_eq!(file.room, "4711");
+}
+
+#[test]
+fn shared_with_me_unauthorized() {
+    let http = Fake::new(vec![Response::new(401, "")]);
+    let err = Files::new(&account()).shared_with_me(&http).unwrap_err();
+    assert!(matches!(err, Error::Unauthorized), "{err:?}");
 }
 
 #[test]
