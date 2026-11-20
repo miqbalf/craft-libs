@@ -106,6 +106,7 @@ fn entry(path: &str, etag: &str) -> Entry {
         etag: Some(etag.to_owned()),
         writable: true,
         shared_by: None,
+        locked_by: None,
     }
 }
 

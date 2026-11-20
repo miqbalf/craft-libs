@@ -37,7 +37,12 @@ fn account() -> Account {
 }
 
 fn multistatus(entries: &str) -> Response {
-    Response::new(207, format!(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">{entries}</d:multistatus>"#))
+    Response::new(
+        207,
+        format!(
+            r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">{entries}</d:multistatus>"#
+        ),
+    )
 }
 
 fn item(href: &str, props: &str) -> String {
@@ -380,4 +385,51 @@ fn path_traversal_is_rejected() {
     let http = Fake::new(Vec::new());
     assert!(matches!(Files::new(&account()).list(&http, "/a/../b"), Err(Error::Malformed(_))));
     assert!(http.requests().is_empty());
+}
+
+#[test]
+fn locked_file_names_who_holds_the_lock() {
+    let own = item("/remote.php/dav/files/u/Docs/", "<d:resourcetype><d:collection/></d:resourcetype>");
+    let locked = item(
+        "/remote.php/dav/files/u/Docs/a.docx",
+        "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner>alice</nc:lock-owner><nc:lock-owner-displayname>Alice Example</nc:lock-owner-displayname><nc:lock-owner-type>0</nc:lock-owner-type>",
+    );
+    let id_only = item("/remote.php/dav/files/u/Docs/b.docx", "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner>alice</nc:lock-owner>");
+    let free = item("/remote.php/dav/files/u/Docs/c.docx", "<d:resourcetype/><nc:lock>0</nc:lock>");
+    let bare = item("/remote.php/dav/files/u/Docs/d.docx", "<d:resourcetype/>");
+    let http = Fake::new(vec![multistatus(&format!("{own}{locked}{id_only}{free}{bare}"))]);
+    let entries = Files::new(&account()).list(&http, "/Docs").unwrap();
+    let by: Vec<Option<&str>> = entries.iter().map(|e| e.locked_by.as_deref()).collect();
+    assert_eq!(by, vec![Some("Alice Example"), Some("alice"), None, None]);
+    let body = body_text(&http.requests()[0]);
+    for prop in ["nc:lock-owner-displayname", "nc:lock-owner"] {
+        assert!(body.contains(prop), "{prop}");
+    }
+}
+
+#[test]
+fn search_reads_lock_owner_too() {
+    let locked = item(
+        "/remote.php/dav/files/u/a.docx",
+        "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner-displayname>Alice Example</nc:lock-owner-displayname>",
+    );
+    let http = Fake::new(vec![multistatus(&locked)]);
+    let entries = Files::new(&account()).search(&http, "a").unwrap();
+    assert_eq!(entries[0].locked_by.as_deref(), Some("Alice Example"));
+    assert!(body_text(&http.requests()[0]).contains("nc:lock-owner-displayname"));
+}
+
+#[test]
+fn a_file_shared_directly_and_through_a_group_is_listed_once() {
+    let body = r#"{"ocs":{"meta":{"statuscode":200},"data":[
+      {"path":"/Shared/r.docx","item_type":"file","uid_owner":"bob","permissions":19,"share_type":0},
+      {"path":"/Shared/other.docx","item_type":"file","uid_owner":"bob","permissions":1,"share_type":1},
+      {"path":"/Shared/r.docx","item_type":"file","uid_owner":"carol","permissions":1,"share_type":1}
+    ]}}"#;
+    let http = Fake::new(vec![Response::new(200, body)]);
+    let entries = Files::new(&account()).shared_with_me(&http).unwrap();
+    let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec!["/Shared/r.docx", "/Shared/other.docx"]);
+    // The first one wins.
+    assert_eq!(entries[0].shared_by.as_deref(), Some("bob"));
 }

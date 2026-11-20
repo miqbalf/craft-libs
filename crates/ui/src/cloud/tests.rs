@@ -181,6 +181,7 @@ fn file(path: &str) -> Entry {
         etag: Some("v1".to_owned()),
         writable: true,
         shared_by: None,
+        locked_by: None,
     }
 }
 

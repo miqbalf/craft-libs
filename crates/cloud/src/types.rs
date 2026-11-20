@@ -77,6 +77,11 @@ pub struct Entry {
     pub writable: bool,
     /// Who shared it, when it came from somebody else.
     pub shared_by: Option<String>,
+    /// Who holds an editing lock on it, as a name to show, when somebody does.
+    ///
+    /// Absent when nothing is locked or the provider has no locks. A caller
+    /// shows "locked by <name>" rather than guessing who is editing.
+    pub locked_by: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

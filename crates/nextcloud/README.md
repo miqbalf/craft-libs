@@ -22,6 +22,12 @@ borrowed from a later `PROPFIND`.
 `search` and `shared_with_me` are tested against in-memory fakes only; neither has been run
 against a live Nextcloud. The `SEARCH` body follows Nextcloud's documented `d:basicsearch`, and the
 share fields follow the OCS sharing API, so check both on a real server before relying on them.
+`search` puts the text into `d:like` as written, so `%` and `_` in it are wildcards: a search for
+`50%` over-matches. Nextcloud's public documentation does not say which escape character `d:like`
+honours, so none is sent rather than a guessed one; nothing here was confirmed against a server.
+`Entry::locked_by` comes from `nc:lock`, `nc:lock-owner-displayname` and `nc:lock-owner` as those
+names are documented for Nextcloud's file locking app; also unchecked against a live server.
+`shared_with_me` keeps the first of several shares of one path.
 Paths from `shared_with_me` carry a leading slash, as `list` and `search` paths do.
 
 ## Multistatus parsing
