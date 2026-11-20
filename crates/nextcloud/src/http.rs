@@ -5,8 +5,8 @@
 //! lets the same code serve a native app and a WebAssembly build, where the only way out is the
 //! browser's own fetch.
 //!
-//! Changed from collab-craft: only the doc comment of `Http` and this note; the types are as
-//! upstream.
+//! Changed from collab-craft: the doc comment of `Http`, `Request::max_body`, and `Debug` for
+//! `Request` and `Response` written by hand so neither prints a credential.
 //!
 //! The split follows the one the Craft apps already use for Zotero, where the wire format and the
 //! socket live in separate modules.
@@ -63,6 +63,10 @@ pub struct Request {
     /// Header names are lowercase, which keeps lookups and test assertions predictable.
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// The most response body bytes the caller will accept, when it has a limit. A transport
+    /// SHOULD stop reading the body past it and fail with its own error, which reaches the caller
+    /// as [`crate::Error::Transport`]; the crate checks the length again after `send` either way.
+    pub max_body: Option<usize>,
 }
 
 impl fmt::Debug for Request {
@@ -75,13 +79,14 @@ impl fmt::Debug for Request {
             .field("url", &self.url)
             .field("headers", &headers)
             .field("body_len", &self.body.len())
+            .field("max_body", &self.max_body)
             .finish()
     }
 }
 
 impl Request {
     pub fn new(method: Method, url: impl Into<String>) -> Request {
-        Request { method, url: url.into(), headers: BTreeMap::new(), body: Vec::new() }
+        Request { method, url: url.into(), headers: BTreeMap::new(), body: Vec::new(), max_body: None }
     }
 
     /// Set a header. The name is lowercased.
@@ -97,6 +102,13 @@ impl Request {
         self
     }
 
+    /// Set [`Request::max_body`].
+    #[must_use]
+    pub fn max_body(mut self, max: usize) -> Request {
+        self.max_body = Some(max);
+        self
+    }
+
     /// Read a header back, by any casing.
     pub fn get_header(&self, name: &str) -> Option<&str> {
         self.headers.get(&name.to_ascii_lowercase()).map(String::as_str)
@@ -104,11 +116,24 @@ impl Request {
 }
 
 /// A response as the transport saw it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Response {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Response {
+    /// The body can carry a credential (a Login Flow poll answer holds the app password), so only
+    /// its length is printed; `authorization` and `set-cookie` values are redacted.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: BTreeMap<&str, &str> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), if k == "authorization" || k == "set-cookie" { "<redacted>" } else { v.as_str() }))
+            .collect();
+        f.debug_struct("Response").field("status", &self.status).field("headers", &headers).field("body_len", &self.body.len()).finish()
+    }
 }
 
 impl Response {
@@ -144,6 +169,11 @@ impl Response {
 /// whatever came off the wire. Do not raise an error for a non-2xx status. The parsers here read
 /// status codes themselves, and Nextcloud reports real outcomes through them, 207 Multi-Status
 /// above all.
+///
+/// When [`Request::max_body`] is set, an implementation SHOULD stop reading the body once it is
+/// longer than that and return its own error, which the crate reports as
+/// [`crate::Error::Transport`]. The crate checks the length again after `send`, but only a
+/// transport that stops early keeps an oversized body out of memory.
 pub trait Http {
     /// The transport's own failure type, carried through [`crate::Error::Transport`].
     type Error: fmt::Display;

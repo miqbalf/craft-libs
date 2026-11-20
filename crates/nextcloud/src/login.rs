@@ -8,7 +8,8 @@
 //! waiting to the caller.
 //!
 //! Changed from collab-craft: only the flow remains; `LoginFlow::start`, `login_url` and the
-//! redacting [`Secret`] are new, and the poll treats 404 as pending only.
+//! redacting [`Secret`] are new, the poll treats 404 as pending only, and both
+//! answers are size-capped.
 //!
 //! Written from Nextcloud's published Login Flow v2 documentation.
 
@@ -62,7 +63,7 @@ impl LoginFlow {
     /// `https://cloud.example.com`.
     pub fn start<H: Http>(http: &H, base: &str) -> Result<LoginFlow> {
         let url = format!("{}/index.php/login/v2", base.trim_end_matches('/'));
-        let resp = crate::send(http, Request::new(Method::Post, url))?;
+        let resp = crate::send(http, Request::new(Method::Post, url), crate::MAX_SMALL)?;
         let v = json(&resp.body)?;
         let login_url = string(&v, "login")?;
         let poll = v.get("poll").ok_or_else(|| Error::malformed("login flow: no poll object"))?;
@@ -84,13 +85,14 @@ impl LoginFlow {
             .header("content-type", "application/x-www-form-urlencoded")
             .body(format!("token={}", crate::encode_segment(self.token.expose())).into_bytes());
         // Not crate::send: here a 404 is the ordinary answer rather than a failure.
-        let resp = http.send(req).map_err(|e| Error::Transport(e.to_string()))?;
+        let resp = crate::fetch(http, req, crate::MAX_SMALL)?;
         if resp.status == 404 {
             return Ok(None);
         }
         if !resp.is_success() {
             return Err(Error::from_response(Method::Post, &resp));
         }
+        let resp = crate::within(resp, crate::MAX_SMALL)?;
         let v = json(&resp.body)?;
         Ok(Some(AppPassword {
             server: string(&v, "server")?,

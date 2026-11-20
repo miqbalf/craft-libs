@@ -30,9 +30,16 @@ use std::fmt;
 
 use http::{Http, Method, Request, Response};
 
-/// Largest response body any parser here will walk, a guard against a server that answers a small
-/// request with something enormous.
-pub(crate) const MAX_BODY: usize = 32 * 1024 * 1024;
+/// Largest listing body (`PROPFIND`, `SEARCH`, shares) the parsers here will walk. A folder of
+/// tens of thousands of entries fits; it matches [`MAX_LISTING_NODES`].
+pub(crate) const MAX_LISTING: usize = 64 * 1024 * 1024;
+/// Most XML nodes in a listing: about 25 per entry at the props asked for, so well over 100,000
+/// entries.
+pub(crate) const MAX_LISTING_NODES: usize = 4_000_000;
+/// Largest body of a small JSON answer (Login Flow, capabilities) or of a write or lock, whose
+/// body is not used: a guard against a server that answers a small request with something
+/// enormous.
+pub(crate) const MAX_SMALL: usize = 1024 * 1024;
 
 /// Where to reach a Nextcloud, and as whom.
 ///
@@ -151,22 +158,28 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// Send a request and reject a non-2xx status (207 Multi-Status passes). A body over
-/// [`MAX_BODY`] is refused: this is for bodies that get parsed.
-pub(crate) fn send<H: Http>(http: &H, req: Request) -> Result<Response> {
-    let resp = send_unbounded(http, req)?;
-    if resp.body.len() > MAX_BODY {
-        return Err(Error::malformed(format!("response body of {} bytes exceeds the cap", resp.body.len())));
-    }
-    Ok(resp)
-}
-
-/// As [`send`], with no cap on the body: the caller enforces its own limit.
-pub(crate) fn send_unbounded<H: Http>(http: &H, req: Request) -> Result<Response> {
+/// Send a request and reject a non-2xx status (207 Multi-Status passes). The request tells the
+/// transport `max_body`, and a 2xx body over it is refused here as well, in case the transport
+/// read it anyway.
+pub(crate) fn send<H: Http>(http: &H, req: Request, max_body: usize) -> Result<Response> {
     let method = req.method;
-    let resp = http.send(req).map_err(|e| Error::Transport(e.to_string()))?;
+    let resp = fetch(http, req, max_body)?;
     if !resp.is_success() {
         return Err(Error::from_response(method, &resp));
+    }
+    within(resp, max_body)
+}
+
+/// Send `req` with [`Request::max_body`] set, whatever the status that comes back. The caller
+/// checks the status, then the length with [`within`].
+pub(crate) fn fetch<H: Http>(http: &H, req: Request, max_body: usize) -> Result<Response> {
+    http.send(req.max_body(max_body)).map_err(|e| Error::Transport(e.to_string()))
+}
+
+/// `resp`, unless its body is over `max_body`.
+pub(crate) fn within(resp: Response, max_body: usize) -> Result<Response> {
+    if resp.body.len() > max_body {
+        return Err(Error::malformed(format!("response body of {} bytes exceeds the {max_body} byte limit", resp.body.len())));
     }
     Ok(resp)
 }

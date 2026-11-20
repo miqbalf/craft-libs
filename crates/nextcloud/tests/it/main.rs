@@ -91,11 +91,10 @@ fn put_with_stale_if_match_is_conflict() {
 
 #[test]
 fn statuses_map_to_the_errors_a_caller_acts_on() {
-    for (status, ok) in [(401, "Unauthorized"), (404, "NotFound"), (423, "Locked")] {
-        let http = Fake::new(vec![Response::new(status, "")]);
-        let err = Files::new(&account()).put(&http, "/a", Vec::new(), None, None).unwrap_err();
-        assert!(format!("{err:?}").starts_with(ok), "{status}: {err:?}");
-    }
+    let put = |status: u16| Files::new(&account()).put(&Fake::new(vec![Response::new(status, "")]), "/a", Vec::new(), None, None).unwrap_err();
+    assert!(matches!(put(401), Error::Unauthorized));
+    assert!(matches!(put(404), Error::NotFound));
+    assert!(matches!(put(423), Error::Locked));
 }
 
 #[test]
@@ -179,8 +178,7 @@ fn capabilities_read_files_locking() {
     assert!(!Files::new(&account()).capabilities(&off).unwrap().locking);
 }
 
-const FLOW_START: &str =
-    r#"{"poll":{"token":"tok","endpoint":"https://cloud.example.net/login/v2/poll"},"login":"https://cloud.example.net/login/v2/flow/x"}"#;
+const FLOW_START: &str = r#"{"poll":{"token":"poll-token-7f3a9","endpoint":"https://cloud.example.net/login/v2/poll"},"login":"https://cloud.example.net/login/v2/flow/x"}"#;
 
 #[test]
 fn login_flow_polls_until_done() {
@@ -205,8 +203,16 @@ fn debug_never_prints_password() {
     let flow = LoginFlow::start(&http, "https://cloud.example.net").unwrap();
     let app = flow.poll(&http).unwrap().unwrap();
     assert!(!format!("{app:?}").contains("hunter2-app"));
-    assert!(!format!("{flow:?}").contains("tok\""));
+    assert!(!format!("{flow:?}").contains("poll-token-7f3a9"));
     assert!(!format!("{:?}", Account::new("https://x", "u", "pw-secret")).contains("pw-secret"));
+
+    // The poll response itself carries the app password in its body, and a cookie in a header.
+    let poll = Response::new(200, r#"{"server":"s","loginName":"alice","appPassword":"hunter2-app"}"#)
+        .header("Set-Cookie", "nc_session=cookie-secret-9")
+        .header("Content-Type", "application/json");
+    let shown = format!("{poll:?}");
+    assert!(!shown.contains("hunter2-app") && !shown.contains("cookie-secret-9"), "{shown}");
+    assert!(shown.contains("200") && shown.contains("set-cookie") && shown.contains("content-type"), "{shown}");
 
     // A recorded request carries the Authorization header, which holds the app password.
     let http = Fake::new(vec![Response::new(201, "").header("ETag", "\"A\"")]);
@@ -445,4 +451,169 @@ fn a_file_shared_directly_and_through_a_group_is_listed_once() {
     let entries = list(vec![share("/Shared/r.docx", "bob", 19), share("/Shared/r.docx", "carol", 1)]);
     assert_eq!(entries.len(), 1);
     assert!(entries[0].writable);
+}
+
+/// Honours [`Request::max_body`] as a streaming transport would: it stops reading past the hint
+/// and fails, so an oversized body never reaches memory whole.
+struct Capped {
+    answer: Response,
+    seen: RefCell<Vec<Request>>,
+}
+
+impl Http for Capped {
+    type Error = String;
+    fn send(&self, req: Request) -> Result<Response, String> {
+        let cap = req.max_body;
+        self.seen.borrow_mut().push(req);
+        match cap {
+            Some(max) if self.answer.body.len() > max => Err(format!("stopped reading past {max} bytes")),
+            _ => Ok(self.answer.clone()),
+        }
+    }
+}
+
+#[test]
+fn a_transport_that_honours_max_body_stops_an_oversized_get() {
+    let http = Capped { answer: Response::new(200, vec![0u8; 10]).header("etag", "\"E\""), seen: RefCell::new(Vec::new()) };
+    let err = Files::new(&account()).get(&http, "/a", 5).unwrap_err();
+    assert!(matches!(err, Error::Transport(_)), "{err:?}");
+    assert_eq!(http.seen.borrow()[0].max_body, Some(5));
+    let (body, _) = Files::new(&account()).get(&http, "/a", 10).unwrap();
+    assert_eq!(body.len(), 10);
+}
+
+#[test]
+fn every_parsed_or_capped_request_carries_the_hint() {
+    let acct = account();
+    let files = Files::new(&acct);
+    let http = Fake::new(vec![
+        Response::new(200, "x").header("etag", "\"E\""),
+        multistatus(""),
+        multistatus(""),
+        Response::new(200, r#"{"ocs":{"meta":{"statuscode":200},"data":[]}}"#),
+        Response::new(200, r#"{"ocs":{"data":{"capabilities":{}}}}"#),
+    ]);
+    files.get(&http, "/a", 1234).unwrap();
+    files.list(&http, "/").unwrap();
+    files.search(&http, "x").unwrap();
+    files.shared_with_me(&http).unwrap();
+    files.capabilities(&http).unwrap();
+    let seen = http.requests();
+    assert_eq!(seen[0].max_body, Some(1234));
+    assert!(seen.iter().all(|r| r.max_body.is_some()), "{seen:?}");
+    // A listing may be far larger than a small JSON answer.
+    assert!(seen[1].max_body > seen[4].max_body);
+
+    let http = Fake::new(vec![Response::new(200, FLOW_START), Response::new(404, "")]);
+    let flow = LoginFlow::start(&http, "https://cloud.example.net").unwrap();
+    flow.poll(&http).unwrap();
+    assert!(http.requests().iter().all(|r| r.max_body.is_some()));
+}
+
+#[test]
+fn an_enormous_poll_answer_is_refused() {
+    let mut body = br#"{"server":"s","loginName":"alice","appPassword":"app-pw"}"#.to_vec();
+    body.extend(std::iter::repeat_n(b' ', 8 * 1024 * 1024));
+    let http = Fake::new(vec![Response::new(200, FLOW_START), Response::new(200, body)]);
+    let flow = LoginFlow::start(&http, "https://cloud.example.net").unwrap();
+    assert!(matches!(flow.poll(&http), Err(Error::Malformed(_))));
+}
+
+#[test]
+fn a_folder_of_twenty_thousand_entries_lists() {
+    let own = item("/remote.php/dav/files/u/Big/", "<d:resourcetype><d:collection/></d:resourcetype>");
+    let rows: String = (0..20_000)
+        .map(|i| {
+            item(
+                &format!("/remote.php/dav/files/u/Big/file%20{i}.docx"),
+                &format!(
+                    "<d:resourcetype/><d:getcontentlength>{i}</d:getcontentlength><d:getetag>\"e{i}\"</d:getetag><oc:fileid>{i}</oc:fileid><oc:permissions>RGDNVW</oc:permissions>"
+                ),
+            )
+        })
+        .collect();
+    let http = Fake::new(vec![multistatus(&format!("{own}{rows}"))]);
+    let entries = Files::new(&account()).list(&http, "/Big").unwrap();
+    assert_eq!(entries.len(), 20_000);
+    assert_eq!(entries[19_999].path, "/Big/file 19999.docx");
+}
+
+#[test]
+fn absolute_uri_hrefs_read_as_plain_paths() {
+    let base = "https://cloud.example.net/remote.php/dav/files/u";
+    for prefix in [base, "/remote.php/dav/files/u"] {
+        let own = item(&format!("{prefix}/Docs/"), "<d:resourcetype><d:collection/></d:resourcetype>");
+        let file = item(&format!("{prefix}/Docs/r%20s.docx"), "<d:resourcetype/>");
+        let root = item(&format!("{prefix}/"), "<d:resourcetype><d:collection/></d:resourcetype>");
+        let http = Fake::new(vec![multistatus(&format!("{own}{file}"))]);
+        let listed = Files::new(&account()).list(&http, "/Docs").unwrap();
+        let paths: Vec<&str> = listed.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/Docs/r s.docx"], "{prefix}");
+
+        let http = Fake::new(vec![multistatus(&format!("{root}{file}"))]);
+        let found = Files::new(&account()).search(&http, "r").unwrap();
+        let paths: Vec<&str> = found.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["/Docs/r s.docx"], "{prefix}");
+    }
+}
+
+#[test]
+fn files_root_match_ends_at_a_segment_boundary() {
+    let acct = Account::new("https://cloud.example.net", "al", "pw-secret");
+    let mine = item("/remote.php/dav/files/al/x", "<d:resourcetype/>");
+    let other = item("/remote.php/dav/files/alice/x", "<d:resourcetype/>");
+    let http = Fake::new(vec![multistatus(&format!("{mine}{other}"))]);
+    let found = Files::new(&acct).search(&http, "x").unwrap();
+    let paths: Vec<&str> = found.iter().map(|e| e.path.as_str()).collect();
+    // `alice`'s file is not a file of `al` at `/ice/x`.
+    assert_eq!(paths, vec!["/x"]);
+}
+
+#[test]
+fn a_lock_aware_put_sends_the_token_as_if() {
+    let http = Fake::new(vec![Response::new(200, "").header("Lock-Token", "<opaquelocktoken:t9>"), Response::new(204, "").header("ETag", "\"B\"")]);
+    let acct = account();
+    let files = Files::new(&acct);
+    let lock = files.lock(&http, "/a.docx", 300).unwrap();
+    files.put(&http, "/a.docx", b"x".to_vec(), None, Some(&lock)).unwrap();
+    let put = &http.requests()[1];
+    assert_eq!(put.method, Method::Put);
+    assert_eq!(put.get_header("if"), Some("(<opaquelocktoken:t9>)"));
+}
+
+#[test]
+fn lock_keeps_the_timeout_the_server_granted() {
+    let granted = Fake::new(vec![Response::new(200, "").header("Lock-Token", "<t>").header("Timeout", "Second-120")]);
+    let lock = Files::new(&account()).lock(&granted, "/a", 3600).unwrap();
+    assert_eq!(lock.timeout_secs, 120);
+    for header in [None, Some("Infinite"), Some("junk")] {
+        let mut resp = Response::new(200, "").header("Lock-Token", "<t>");
+        if let Some(h) = header {
+            resp = resp.header("Timeout", h);
+        }
+        let lock = Files::new(&account()).lock(&Fake::new(vec![resp]), "/a", 3600).unwrap();
+        assert_eq!(lock.timeout_secs, 3600, "{header:?}");
+    }
+}
+
+#[test]
+fn writes_and_locks_refuse_the_files_root() {
+    let http = Fake::new(Vec::new());
+    let files_acct = account();
+    let files = Files::new(&files_acct);
+    for path in ["", "/", "//"] {
+        assert!(matches!(files.put(&http, path, Vec::new(), None, None), Err(Error::Malformed(_))), "{path:?}");
+        assert!(matches!(files.create(&http, path, Vec::new()), Err(Error::Malformed(_))), "{path:?}");
+        assert!(matches!(files.lock(&http, path, 60), Err(Error::Malformed(_))), "{path:?}");
+    }
+    assert!(http.requests().is_empty());
+}
+
+#[test]
+fn a_status_is_reported_even_when_its_body_is_over_the_limit() {
+    let page = vec![b'x'; 64];
+    let http = Fake::new(vec![Response::new(404, page.clone())]);
+    assert!(matches!(Files::new(&account()).get(&http, "/a", 8), Err(Error::NotFound)));
+    let http = Fake::new(vec![Response::new(423, page)]);
+    assert!(matches!(Files::new(&account()).get(&http, "/a", 8), Err(Error::Locked)));
 }

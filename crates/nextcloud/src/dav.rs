@@ -11,11 +11,11 @@
 //! `stat`, ranged reads, `mkdir`, `delete` and `exists` were left out.
 
 use craft_cloud::{Entry, EntryKind, LockHolder};
-use craft_dav::{href, parse_multistatus, properties, responses};
+use craft_dav::{Limits, href, parse_multistatus_with, properties, responses};
 
 use crate::error::{Error, Result};
 use crate::http::{Http, Method, Response};
-use crate::{Account, encode_path, encode_segment, send, send_unbounded};
+use crate::{Account, MAX_LISTING, MAX_LISTING_NODES, MAX_SMALL, encode_path, encode_segment, send};
 
 /// The properties asked for. A small set keeps the answer small on a folder with thousands of
 /// entries.
@@ -85,7 +85,8 @@ pub struct Lock {
     /// The token to send back as `If`, or to `UNLOCK` with.
     pub token: String,
     pub path: String,
-    /// The timeout asked for, which [`Files::refresh`] asks for again.
+    /// The timeout the server granted in its `Timeout` header, or the one asked for when it sent
+    /// none it could be read from. [`Files::refresh`] asks for it again.
     pub timeout_secs: u32,
 }
 
@@ -104,6 +105,15 @@ pub struct Files<'a> {
 impl<'a> Files<'a> {
     pub fn new(account: &'a Account) -> Files<'a> {
         Files { account }
+    }
+
+    /// Absolute URL for a file under the user's files root, refusing the root itself: nothing is
+    /// written to or locked there.
+    fn file_url(&self, path: &str) -> Result<String> {
+        if encode_path(path)?.is_empty() {
+            return Err(Error::malformed("path names no file"));
+        }
+        self.url(path)
     }
 
     /// Absolute URL for a path under the user's files root. The root is a collection, so it keeps
@@ -127,7 +137,7 @@ impl<'a> Files<'a> {
             .header("content-type", "application/xml; charset=utf-8")
             .header("accept", "application/xml")
             .body(propfind_body().into_bytes());
-        let resp = send(http, req)?;
+        let resp = send(http, req, MAX_LISTING)?;
 
         let own = decode(&href_path(&url));
         self.entries(&resp, Some(own.trim_end_matches('/')))
@@ -153,7 +163,7 @@ impl<'a> Files<'a> {
             .header("content-type", "text/xml")
             .header("accept", "application/xml")
             .body(body.into_bytes());
-        let resp = send(http, req)?;
+        let resp = send(http, req, MAX_LISTING)?;
         self.entries(&resp, None)
     }
 
@@ -162,7 +172,7 @@ impl<'a> Files<'a> {
     pub fn shared_with_me<H: Http>(&self, http: &H) -> Result<Vec<Entry>> {
         let url = format!("{}/ocs/v2.php/apps/files_sharing/api/v1/shares?shared_with_me=true&format=json", self.account.base());
         let req = self.account.request(Method::Get, url).header("accept", "application/json");
-        let resp = send(http, req)?;
+        let resp = send(http, req, MAX_LISTING)?;
         let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| Error::malformed(format!("shares: {e}")))?;
         match v.pointer("/ocs/meta/statuscode").and_then(serde_json::Value::as_i64) {
             Some(100 | 200) => {}
@@ -182,20 +192,27 @@ impl<'a> Files<'a> {
         Ok(out)
     }
 
-    /// Entries of a multistatus, skipping the entry whose decoded path is `skip` and, for any
-    /// answer, the files root itself.
+    /// Entries of a multistatus, skipping the entry whose decoded path is `skip`, the files root
+    /// itself, and any href outside the files root, which no path of this account can name.
+    ///
+    /// An href may be an absolute URI or a path (RFC 4918 §8.3); only its path is read.
     fn entries(&self, resp: &Response, skip: Option<&str>) -> Result<Vec<Entry>> {
-        let root = parse_multistatus(&resp.body).map_err(|e| Error::malformed(e.to_string()))?;
+        let limits = Limits { max_bytes: MAX_LISTING, max_nodes: MAX_LISTING_NODES, ..Limits::default() };
+        let root = parse_multistatus_with(&resp.body, limits).map_err(|e| Error::malformed(e.to_string()))?;
         let files_root = decode(&href_path(&self.account.files_root()));
         let mut out = Vec::new();
         for response in responses(&root) {
             let Some(h) = href(response) else { continue };
-            let decoded = decode(&h);
+            let decoded = decode(&href_path(&h));
             let trimmed = decoded.trim_end_matches('/');
-            if skip.is_some_and(|own| trimmed == own) || trimmed == files_root {
+            if skip.is_some_and(|own| trimmed == own) {
                 continue;
             }
-            out.push(entry_from(response, &h, &files_root));
+            let Some(relative) = under(trimmed, &files_root) else { continue };
+            if relative.is_empty() {
+                continue;
+            }
+            out.push(entry_from(response, relative));
         }
         Ok(out)
     }
@@ -205,10 +222,7 @@ impl<'a> Files<'a> {
     pub fn get<H: Http>(&self, http: &H, path: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
         let req = self.account.request(Method::Get, self.url(path)?);
         // Only the caller's limit applies to a file, not the cap on parsed bodies.
-        let resp = send_unbounded(http, req)?;
-        if resp.body.len() > max_bytes {
-            return Err(Error::malformed(format!("file of {} bytes exceeds the {max_bytes} byte limit", resp.body.len())));
-        }
+        let resp = send(http, req, max_bytes)?;
         let etag = response_etag(&resp)?;
         Ok((resp.body, etag))
     }
@@ -223,14 +237,14 @@ impl<'a> Files<'a> {
     /// instead read whatever version exists then, which is somebody else's when they saved in
     /// between. A server that sends no ETag gives `Malformed("no etag")`.
     pub fn put<H: Http>(&self, http: &H, path: &str, bytes: Vec<u8>, if_match: Option<&str>, lock: Option<&Lock>) -> Result<String> {
-        let mut req = self.account.request(Method::Put, self.url(path)?).header("content-type", "application/octet-stream").body(bytes);
+        let mut req = self.account.request(Method::Put, self.file_url(path)?).header("content-type", "application/octet-stream").body(bytes);
         if let Some(etag) = if_match {
             req = req.header("if-match", quoted(etag));
         }
         if let Some(lock) = lock {
             req = req.header("if", format!("(<{}>)", lock.token));
         }
-        response_etag(&send(http, req)?)
+        response_etag(&send(http, req, MAX_SMALL)?)
     }
 
     /// Create a file, refusing to replace one that exists.
@@ -241,15 +255,16 @@ impl<'a> Files<'a> {
     pub fn create<H: Http>(&self, http: &H, path: &str, bytes: Vec<u8>) -> Result<String> {
         let req = self
             .account
-            .request(Method::Put, self.url(path)?)
+            .request(Method::Put, self.file_url(path)?)
             .header("content-type", "application/octet-stream")
             .header("if-none-match", "*")
             .body(bytes);
-        response_etag(&send(http, req)?)
+        response_etag(&send(http, req, MAX_SMALL)?)
     }
 
-    /// Take an exclusive write lock. `timeout_secs` is a request, and the server may shorten it.
-    /// Another holder gives [`Error::Locked`].
+    /// Take an exclusive write lock. `timeout_secs` is a request, and the server may shorten it:
+    /// the returned [`Lock`] carries what the server granted. Another holder gives
+    /// [`Error::Locked`].
     pub fn lock<H: Http>(&self, http: &H, path: &str, timeout_secs: u32) -> Result<Lock> {
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
@@ -262,16 +277,17 @@ impl<'a> Files<'a> {
         );
         let req = self
             .account
-            .request(Method::Lock, self.url(path)?)
+            .request(Method::Lock, self.file_url(path)?)
             .header("timeout", format!("Second-{timeout_secs}"))
             .header("content-type", "application/xml; charset=utf-8")
             .body(body.into_bytes());
-        let resp = send(http, req)?;
+        let resp = send(http, req, MAX_SMALL)?;
         let token = resp
             .get_header("lock-token")
             .map(|t| t.trim().trim_matches(['<', '>']).to_owned())
             .filter(|t| !t.is_empty())
             .ok_or_else(|| Error::malformed("no Lock-Token header in the lock response"))?;
+        let timeout_secs = resp.get_header("timeout").and_then(granted_timeout).unwrap_or(timeout_secs);
         Ok(Lock { token, path: path.to_owned(), timeout_secs })
     }
 
@@ -282,14 +298,14 @@ impl<'a> Files<'a> {
             .request(Method::Lock, self.url(&lock.path)?)
             .header("if", format!("(<{}>)", lock.token))
             .header("timeout", format!("Second-{}", lock.timeout_secs));
-        send(http, req)?;
+        send(http, req, MAX_SMALL)?;
         Ok(())
     }
 
     /// Release a lock taken by [`Files::lock`].
     pub fn unlock<H: Http>(&self, http: &H, lock: &Lock) -> Result<()> {
         let req = self.account.request(Method::Unlock, self.url(&lock.path)?).header("lock-token", format!("<{}>", lock.token));
-        send(http, req)?;
+        send(http, req, MAX_SMALL)?;
         Ok(())
     }
 
@@ -297,7 +313,7 @@ impl<'a> Files<'a> {
     pub fn capabilities<H: Http>(&self, http: &H) -> Result<Capabilities> {
         let url = format!("{}/ocs/v1.php/cloud/capabilities?format=json", self.account.base());
         let req = self.account.request(Method::Get, url).header("accept", "application/json");
-        let resp = send(http, req)?;
+        let resp = send(http, req, MAX_SMALL)?;
         let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| Error::malformed(format!("capabilities: {e}")))?;
         let locking = match v.pointer("/ocs/data/capabilities/files/locking") {
             None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => false,
@@ -344,11 +360,27 @@ fn share_entry(share: &serde_json::Value) -> Option<Entry> {
     })
 }
 
-/// Build an [`Entry`] from one `response`. Every property is optional.
-fn entry_from(response: &craft_xml::El, href: &str, files_root: &str) -> Entry {
-    let decoded = decode(href);
-    let relative = decoded.strip_prefix(files_root).unwrap_or(&decoded).trim_end_matches('/');
-    let path = if relative.starts_with('/') { relative.to_owned() } else { format!("/{relative}") };
+/// `path` relative to `root`, starting with `/` or empty for the root itself, or `None` when
+/// `path` is not under `root`. The match ends at a segment boundary, so `/files/al` is not a
+/// root of `/files/alice/x`.
+fn under<'p>(path: &'p str, root: &str) -> Option<&'p str> {
+    let rest = path.strip_prefix(root)?;
+    (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+}
+
+/// The seconds of a `Timeout` header the server granted (`Second-120`), or `None` for
+/// `Infinite` or anything unreadable.
+fn granted_timeout(header: &str) -> Option<u32> {
+    // RFC 4918 §10.7 allows a list; the first entry is the server's answer.
+    let first = header.split(',').next()?.trim();
+    let secs = first.get(..7).filter(|p| p.eq_ignore_ascii_case("second-")).and(first.get(7..))?;
+    secs.parse().ok()
+}
+
+/// Build an [`Entry`] from one `response`, whose decoded path relative to the files root is
+/// `relative` (starting with `/`). Every property is optional.
+fn entry_from(response: &craft_xml::El, relative: &str) -> Entry {
+    let path = relative.to_owned();
     let name = path.rsplit('/').next().unwrap_or_default().to_owned();
 
     let mut is_dir = false;
@@ -383,9 +415,10 @@ fn entry_from(response: &craft_xml::El, href: &str, files_root: &str) -> Entry {
     };
     // A file shared in carries the owner's id, which is not ours when it was shared.
     let shared_by = if permissions.contains('S') { owner } else { None };
-    // Locked only when `nc:lock` says so; an owner prop alone does not make it so. Type 1 is an
-    // app lock (the editor holds it for the user), 0 a user and 2 a WebDAV token, in Nextcloud's
-    // published WebDAV documentation.
+    // Locked only when `nc:lock` says so; an owner prop alone does not make it so.
+    // `nc:lock-owner-type` is 0 for a user, 1 for an app (Office or Text, holding it for the user
+    // named in `nc:lock-owner`) and 2 for a WebDAV lock, per Nextcloud's developer manual:
+    // https://docs.nextcloud.com/server/stable/developer_manual/client_apis/WebDAV/basic.html
     let locked = lock.eq_ignore_ascii_case("1") || lock.eq_ignore_ascii_case("true");
     let lock = locked.then(|| LockHolder { id: lock_owner, name: lock_name, app: lock_type == "1" });
     Entry {
