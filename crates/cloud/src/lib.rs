@@ -32,7 +32,8 @@ mod types;
 
 pub use error::{Error, Result};
 pub use types::{
-    Capability, Contact, Conversation, Entry, EntryKind, Identity, MailMessage, Notification, Permission, Share, ShareOptions, ShareTarget,
+    Capability, Contact, Conversation, Entry, EntryKind, Identity, LockHolder, MailMessage, Notification, Permission, Share, ShareOptions,
+    ShareTarget,
 };
 
 /// Reading and writing documents.

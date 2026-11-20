@@ -46,7 +46,7 @@ pub enum Capability {
 }
 
 /// A file or folder.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// An opaque handle for reading, writing and sharing this entry.
     ///
@@ -77,16 +77,29 @@ pub struct Entry {
     pub writable: bool,
     /// Who shared it, when it came from somebody else.
     pub shared_by: Option<String>,
-    /// Who holds an editing lock on it, as a name to show, when somebody does.
+    /// Who holds an editing lock on it, when somebody does.
     ///
-    /// Absent when nothing is locked or the provider has no locks. A caller
-    /// shows "locked by <name>" rather than guessing who is editing.
-    pub locked_by: Option<String>,
+    /// `None` means not locked, or a provider with no locks. A lock whose holder the
+    /// provider does not name is still `Some`, with both names absent.
+    pub lock: Option<LockHolder>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Who holds an editing lock.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockHolder {
+    /// The holder's account id, when the provider gives one. Absent for an app lock.
+    pub id: Option<String>,
+    /// What to show. A display name where there is one.
+    pub name: Option<String>,
+    /// Held by an editing app on somebody's behalf, rather than by a person.
+    pub app: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
+    /// Also the [`Default`], so an [`Entry`] can be built with `..Default::default()`.
+    #[default]
     File,
     Folder,
 }

@@ -232,7 +232,7 @@ fn a_read_of_a_document_that_is_not_there_is_put_to_the_user_not_silently_droppe
         etag: None,
         writable: true,
         shared_by: None,
-        locked_by: None,
+        lock: None,
     };
     cloud::submit(&app, Job::Read { entry: ghost, into: None });
     settle(&mut app, &ctx, |app| !app.said.lock().unwrap().is_empty());

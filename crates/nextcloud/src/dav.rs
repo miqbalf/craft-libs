@@ -10,7 +10,7 @@
 //! cap and returns the ETag; `lock` refresh, `capabilities` and lock-aware `put` are new;
 //! `stat`, ranged reads, `mkdir`, `delete` and `exists` were left out.
 
-use craft_cloud::{Entry, EntryKind};
+use craft_cloud::{Entry, EntryKind, LockHolder};
 use craft_dav::{href, parse_multistatus, properties, responses};
 
 use crate::error::{Error, Result};
@@ -29,7 +29,8 @@ const PROPS: &str = r#"    <d:resourcetype/>
     <oc:owner-id/>
     <nc:lock/>
     <nc:lock-owner/>
-    <nc:lock-owner-displayname/>"#;
+    <nc:lock-owner-displayname/>
+    <nc:lock-owner-type/>"#;
 
 /// The `PROPFIND` request body, asking for [`PROPS`].
 fn propfind_body() -> String {
@@ -137,10 +138,9 @@ impl<'a> Files<'a> {
     /// A `SEARCH` on the DAV root, `d:like` on `d:displayname` with `%text%`, from the user's
     /// files at any depth, at most 200 results. Entries are as [`Files::list`] gives them.
     ///
-    /// `text` is matched as written inside a SQL-style `LIKE`, so a `%` or `_` in it acts as a
-    /// wildcard and a search for `50%` also finds names that merely contain `50`. Nextcloud's
-    /// public documentation does not say which escape character `d:like` honours, so none is
-    /// sent rather than a guessed one. See the README's "Not verified" list.
+    /// `text` goes into the `LIKE` as written. Which escape character `d:like` honours is not
+    /// confirmed and was not researched, so none is sent: a `%` or `_` in `text` may act as a
+    /// wildcard, and a search for `50%` may over-match. See the README's "Not verified" list.
     pub fn search<H: Http>(&self, http: &H, text: &str) -> Result<Vec<Entry>> {
         let text = text.trim();
         if text.is_empty() {
@@ -170,9 +170,16 @@ impl<'a> Files<'a> {
             None => return Err(Error::malformed("shares: no OCS status")),
         }
         let data = v.pointer("/ocs/data").and_then(serde_json::Value::as_array).ok_or_else(|| Error::malformed("shares: data is not a list"))?;
-        // A file shared directly and through a group comes back once per share. Keep the first.
-        let mut seen = std::collections::HashSet::new();
-        Ok(data.iter().filter_map(share_entry).filter(|e| seen.insert(e.path.clone())).collect())
+        // A file shared directly and through a group comes back once per share. Keep the first,
+        // and let any share that may write make the entry writable, so access is never lost.
+        let mut out: Vec<Entry> = Vec::new();
+        for entry in data.iter().filter_map(share_entry) {
+            match out.iter_mut().find(|e| e.path == entry.path) {
+                Some(first) => first.writable |= entry.writable,
+                None => out.push(entry),
+            }
+        }
+        Ok(out)
     }
 
     /// Entries of a multistatus, skipping the entry whose decoded path is `skip` and, for any
@@ -333,7 +340,7 @@ fn share_entry(share: &serde_json::Value) -> Option<Entry> {
         etag: None,
         writable,
         shared_by: text("uid_owner").or_else(|| text("displayname_owner")),
-        locked_by: None,
+        lock: None,
     })
 }
 
@@ -346,7 +353,7 @@ fn entry_from(response: &craft_xml::El, href: &str, files_root: &str) -> Entry {
 
     let mut is_dir = false;
     let (mut size, mut mime, mut modified, mut etag, mut file_id, mut permissions, mut owner) = (None, None, None, None, None, String::new(), None);
-    let (mut lock, mut lock_owner, mut lock_name) = (String::new(), None, None);
+    let (mut lock, mut lock_owner, mut lock_name, mut lock_type) = (String::new(), None, None, String::new());
     for prop in properties(response) {
         let text = prop.text().trim().to_owned();
         match prop.name.as_str() {
@@ -360,6 +367,7 @@ fn entry_from(response: &craft_xml::El, href: &str, files_root: &str) -> Entry {
             "oc:owner-id" => owner = Some(text).filter(|t| !t.is_empty()),
             "nc:lock" => lock = text,
             "nc:lock-owner" => lock_owner = Some(text).filter(|t| !t.is_empty()),
+            "nc:lock-owner-type" => lock_type = text,
             "nc:lock-owner-displayname" => lock_name = Some(text).filter(|t| !t.is_empty()),
             _ => {}
         }
@@ -375,8 +383,11 @@ fn entry_from(response: &craft_xml::El, href: &str, files_root: &str) -> Entry {
     };
     // A file shared in carries the owner's id, which is not ours when it was shared.
     let shared_by = if permissions.contains('S') { owner } else { None };
-    // A lock that is explicitly off names nobody; otherwise the display name, then the user id.
-    let locked_by = if matches!(lock.as_str(), "0" | "false") { None } else { lock_name.or(lock_owner) };
+    // Locked only when `nc:lock` says so; an owner prop alone does not make it so. Type 1 is an
+    // app lock (the editor holds it for the user), 0 a user and 2 a WebDAV token, in Nextcloud's
+    // published WebDAV documentation.
+    let locked = lock.eq_ignore_ascii_case("1") || lock.eq_ignore_ascii_case("true");
+    let lock = locked.then(|| LockHolder { id: lock_owner, name: lock_name, app: lock_type == "1" });
     Entry {
         id: path.clone(),
         // The file id survives a rename; the path does not.
@@ -390,7 +401,7 @@ fn entry_from(response: &craft_xml::El, href: &str, files_root: &str) -> Entry {
         etag,
         writable,
         shared_by,
-        locked_by,
+        lock,
     }
 }
 

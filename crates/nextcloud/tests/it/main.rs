@@ -388,48 +388,61 @@ fn path_traversal_is_rejected() {
 }
 
 #[test]
-fn locked_file_names_who_holds_the_lock() {
+fn lock_reads_holder_and_kind() {
     let own = item("/remote.php/dav/files/u/Docs/", "<d:resourcetype><d:collection/></d:resourcetype>");
-    let locked = item(
-        "/remote.php/dav/files/u/Docs/a.docx",
+    let docs = "/remote.php/dav/files/u/Docs";
+    let named = item(
+        &format!("{docs}/a.docx"),
         "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner>alice</nc:lock-owner><nc:lock-owner-displayname>Alice Example</nc:lock-owner-displayname><nc:lock-owner-type>0</nc:lock-owner-type>",
     );
-    let id_only = item("/remote.php/dav/files/u/Docs/b.docx", "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner>alice</nc:lock-owner>");
-    let free = item("/remote.php/dav/files/u/Docs/c.docx", "<d:resourcetype/><nc:lock>0</nc:lock>");
-    let bare = item("/remote.php/dav/files/u/Docs/d.docx", "<d:resourcetype/>");
-    let http = Fake::new(vec![multistatus(&format!("{own}{locked}{id_only}{free}{bare}"))]);
-    let entries = Files::new(&account()).list(&http, "/Docs").unwrap();
-    let by: Vec<Option<&str>> = entries.iter().map(|e| e.locked_by.as_deref()).collect();
-    assert_eq!(by, vec![Some("Alice Example"), Some("alice"), None, None]);
+    let nobody = item(&format!("{docs}/b.docx"), "<d:resourcetype/><nc:lock>1</nc:lock>");
+    let upper = item(&format!("{docs}/c.docx"), "<d:resourcetype/><nc:lock>TRUE</nc:lock><nc:lock-owner>alice</nc:lock-owner>");
+    let app = item(&format!("{docs}/d.docx"), "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner-type>1</nc:lock-owner-type>");
+    let off = item(&format!("{docs}/e.docx"), "<d:resourcetype/><nc:lock>0</nc:lock><nc:lock-owner>alice</nc:lock-owner>");
+    let empty = item(&format!("{docs}/f.docx"), "<d:resourcetype/><nc:lock></nc:lock><nc:lock-owner>alice</nc:lock-owner>");
+    let absent = item(&format!("{docs}/g.docx"), "<d:resourcetype/><nc:lock-owner>alice</nc:lock-owner>");
+    let http = Fake::new(vec![multistatus(&format!("{own}{named}{nobody}{upper}{app}{off}{empty}{absent}"))]);
+    let e = Files::new(&account()).list(&http, "/Docs").unwrap();
+    let lock = |i: usize| e[i].lock.clone();
+    let l = lock(0).unwrap();
+    assert_eq!((l.id.as_deref(), l.name.as_deref(), l.app), (Some("alice"), Some("Alice Example"), false));
+    // Locked with nobody named is still locked.
+    assert_eq!(lock(1), Some(craft_cloud::LockHolder::default()));
+    assert_eq!(lock(2).and_then(|l| l.id).as_deref(), Some("alice"));
+    assert!(lock(3).is_some_and(|l| l.app && l.id.is_none()));
+    // An owner prop alone does not make a file locked.
+    assert_eq!((lock(4), lock(5), lock(6)), (None, None, None));
     let body = body_text(&http.requests()[0]);
-    for prop in ["nc:lock-owner-displayname", "nc:lock-owner"] {
-        assert!(body.contains(prop), "{prop}");
-    }
+    assert!(body.contains("nc:lock-owner-displayname") && body.contains("nc:lock-owner-type"));
 }
 
 #[test]
-fn search_reads_lock_owner_too() {
+fn search_reads_lock_too() {
     let locked = item(
         "/remote.php/dav/files/u/a.docx",
         "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner-displayname>Alice Example</nc:lock-owner-displayname>",
     );
     let http = Fake::new(vec![multistatus(&locked)]);
     let entries = Files::new(&account()).search(&http, "a").unwrap();
-    assert_eq!(entries[0].locked_by.as_deref(), Some("Alice Example"));
-    assert!(body_text(&http.requests()[0]).contains("nc:lock-owner-displayname"));
+    assert_eq!(entries[0].lock.as_ref().and_then(|l| l.name.as_deref()), Some("Alice Example"));
 }
 
 #[test]
 fn a_file_shared_directly_and_through_a_group_is_listed_once() {
-    let body = r#"{"ocs":{"meta":{"statuscode":200},"data":[
-      {"path":"/Shared/r.docx","item_type":"file","uid_owner":"bob","permissions":19,"share_type":0},
-      {"path":"/Shared/other.docx","item_type":"file","uid_owner":"bob","permissions":1,"share_type":1},
-      {"path":"/Shared/r.docx","item_type":"file","uid_owner":"carol","permissions":1,"share_type":1}
-    ]}}"#;
-    let http = Fake::new(vec![Response::new(200, body)]);
-    let entries = Files::new(&account()).shared_with_me(&http).unwrap();
+    let share =
+        |path: &str, owner: &str, perms: u32| format!(r#"{{"path":"{path}","item_type":"file","uid_owner":"{owner}","permissions":{perms}}}"#);
+    let body = |shares: Vec<String>| format!(r#"{{"ocs":{{"meta":{{"statuscode":200}},"data":[{}]}}}}"#, shares.join(","));
+    let list = |shares: Vec<String>| Files::new(&account()).shared_with_me(&Fake::new(vec![Response::new(200, body(shares))])).unwrap();
+
+    // Read-only first, writable second: still writable, and the first sharer is kept.
+    let entries = list(vec![share("/Shared/r.docx", "bob", 1), share("/Shared/other.docx", "bob", 1), share("/Shared/r.docx", "carol", 19)]);
     let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     assert_eq!(paths, vec!["/Shared/r.docx", "/Shared/other.docx"]);
-    // The first one wins.
+    assert!(entries[0].writable && !entries[1].writable);
     assert_eq!(entries[0].shared_by.as_deref(), Some("bob"));
+
+    // Writable first, read-only second: stays writable.
+    let entries = list(vec![share("/Shared/r.docx", "bob", 19), share("/Shared/r.docx", "carol", 1)]);
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].writable);
 }

@@ -273,7 +273,7 @@ fn list(root: &Path, path: &str) -> Result<Vec<Entry>, Fault> {
             etag: if meta.is_dir() { None } else { Some(etag_of(&meta)) },
             writable: true,
             shared_by: None,
-            locked_by: None,
+            lock: None,
             path: id.clone(),
             id,
         });
@@ -428,7 +428,7 @@ fn create(root: &Path, folder: &str, name: &str, bytes: &[u8]) -> Result<Entry, 
         etag: Some(etag_of(&meta)),
         writable: true,
         shared_by: None,
-        locked_by: None,
+        lock: None,
         path: id.clone(),
         id,
     })

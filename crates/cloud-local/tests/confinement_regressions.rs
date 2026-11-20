@@ -235,7 +235,7 @@ fn leaked_entry(id: &str, name: &str) -> Entry {
         etag: None,
         writable: true,
         shared_by: None,
-        locked_by: None,
+        lock: None,
     }
 }
 
