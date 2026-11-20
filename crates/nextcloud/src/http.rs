@@ -54,13 +54,27 @@ impl fmt::Display for Method {
 }
 
 /// A request to send. `url` is absolute, so a transport needs no base of its own.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     pub method: Method,
     pub url: String,
     /// Header names are lowercase, which keeps lookups and test assertions predictable.
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Request {
+    /// The `authorization` header carries the app password, so it is never printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: BTreeMap<&str, &str> =
+            self.headers.iter().map(|(k, v)| (k.as_str(), if k == "authorization" { "<redacted>" } else { v.as_str() })).collect();
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl Request {

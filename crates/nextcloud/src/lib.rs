@@ -151,13 +151,20 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// Send a request and reject a non-2xx status (207 Multi-Status passes).
+/// Send a request and reject a non-2xx status (207 Multi-Status passes). A body over
+/// [`MAX_BODY`] is refused: this is for bodies that get parsed.
 pub(crate) fn send<H: Http>(http: &H, req: Request) -> Result<Response> {
-    let method = req.method;
-    let resp = http.send(req).map_err(|e| Error::Transport(e.to_string()))?;
+    let resp = send_unbounded(http, req)?;
     if resp.body.len() > MAX_BODY {
         return Err(Error::malformed(format!("response body of {} bytes exceeds the cap", resp.body.len())));
     }
+    Ok(resp)
+}
+
+/// As [`send`], with no cap on the body: the caller enforces its own limit.
+pub(crate) fn send_unbounded<H: Http>(http: &H, req: Request) -> Result<Response> {
+    let method = req.method;
+    let resp = http.send(req).map_err(|e| Error::Transport(e.to_string()))?;
     if !resp.is_success() {
         return Err(Error::from_response(method, &resp));
     }

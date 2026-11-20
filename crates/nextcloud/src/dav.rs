@@ -15,7 +15,7 @@ use craft_dav::{href, parse_multistatus, properties, responses};
 
 use crate::error::{Error, Result};
 use crate::http::{Http, Method, Response};
-use crate::{Account, encode_path, send};
+use crate::{Account, encode_path, send, send_unbounded};
 
 /// The properties asked for. A small set keeps the answer small on a folder with thousands of
 /// entries.
@@ -104,7 +104,8 @@ impl<'a> Files<'a> {
     /// version, unquoted.
     pub fn get<H: Http>(&self, http: &H, path: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
         let req = self.account.request(Method::Get, self.url(path)?);
-        let resp = send(http, req)?;
+        // Only the caller's limit applies to a file, not the cap on parsed bodies.
+        let resp = send_unbounded(http, req)?;
         if resp.body.len() > max_bytes {
             return Err(Error::malformed(format!("file of {} bytes exceeds the {max_bytes} byte limit", resp.body.len())));
         }

@@ -143,6 +143,16 @@ fn get_refuses_a_body_over_the_limit() {
 }
 
 #[test]
+fn get_limit_is_the_callers_not_a_hidden_cap() {
+    let forty_mib = 40 * 1024 * 1024;
+    let http = Fake::new(vec![Response::new(200, vec![7u8; forty_mib]).header("etag", "\"E\"")]);
+    let (body, _) = Files::new(&account()).get(&http, "/big", 100 * 1024 * 1024).unwrap();
+    assert_eq!(body.len(), forty_mib);
+    let http = Fake::new(vec![Response::new(200, vec![7u8; forty_mib]).header("etag", "\"E\"")]);
+    assert!(matches!(Files::new(&account()).get(&http, "/big", 30 * 1024 * 1024), Err(Error::Malformed(_))));
+}
+
+#[test]
 fn lock_refresh_unlock_use_the_token() {
     let http = Fake::new(vec![Response::new(200, "").header("Lock-Token", "<opaquelocktoken:t1>"), Response::new(200, ""), Response::new(204, "")]);
     let acct = account();
@@ -192,6 +202,16 @@ fn debug_never_prints_password() {
     assert!(!format!("{app:?}").contains("hunter2-app"));
     assert!(!format!("{flow:?}").contains("tok\""));
     assert!(!format!("{:?}", Account::new("https://x", "u", "pw-secret")).contains("pw-secret"));
+
+    // A recorded request carries the Authorization header, which holds the app password.
+    let http = Fake::new(vec![Response::new(201, "").header("ETag", "\"A\"")]);
+    let acct = Account::new("https://x", "u", "pw-secret");
+    Files::new(&acct).create(&http, "/a", Vec::new()).unwrap();
+    let req = &http.requests()[0];
+    assert!(req.get_header("authorization").is_some_and(|h| h.starts_with("Basic ")));
+    let shown = format!("{req:?}");
+    let encoded = req.get_header("authorization").unwrap_or_default().trim_start_matches("Basic ").to_owned();
+    assert!(!shown.contains("pw-secret") && !shown.contains(&encoded), "{shown}");
 }
 
 /// The hostile-input sweep: each answer is an error, never a panic.
