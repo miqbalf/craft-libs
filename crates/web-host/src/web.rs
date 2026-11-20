@@ -14,6 +14,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::js_sys;
 
+use crate::live::{LIVE_TYPE, LiveError, LiveMessage, LiveState, READY_JSON};
 use crate::{Inbox, Incoming, Mode, Outgoing, VERSION, file_name, message_type};
 
 /// A file the host passes in, not yet copied into the app's memory: check its size first.
@@ -140,6 +141,47 @@ impl Host {
     /// `reads_files`: it takes a `File`/`Blob` and reads it in slices.
     pub fn post_ready(&self, app_version: &str, reads_files: bool) -> Result<(), String> {
         self.post(Outgoing::Ready, &[("version", VERSION.into()), ("appVersion", app_version.into()), ("file", reads_files.into())], None)
+    }
+
+    /// Hear the host's unprefixed `live` messages (`craft-live/1`), only from the framing parent
+    /// on this origin. A refused message arrives as its [`LiveError`]; the ticket is never logged.
+    /// A page-mode host (`data-host="page"`) has no live channel, so nothing is heard there.
+    pub fn listen_live(&self, handler: impl Fn(Result<LiveMessage, LiveError>) + 'static) {
+        let Transport::Parent { window, parent, origin } = &self.transport else { return };
+        let (parent, origin) = (parent.clone(), origin.clone());
+        let on_message = Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
+                return;
+            }
+            let data = event.data();
+            if string(&data, "type").as_deref() != Some(LIVE_TYPE) {
+                return;
+            }
+            let json = js_sys::JSON::stringify(&data).ok().and_then(|s| s.as_string());
+            handler(match json {
+                Some(json) => LiveMessage::parse(&json),
+                None => Err(LiveError::Malformed("not serialisable".into())),
+            });
+        });
+        if window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref()).is_ok() {
+            on_message.forget();
+        }
+    }
+
+    /// Tell a live host the app is listening (`{type:"ready"}`, unprefixed), so it posts `live`.
+    pub fn post_live_ready(&self) -> Result<(), String> {
+        self.post_json(READY_JSON)
+    }
+
+    /// Report the live session's state and peers to the host.
+    pub fn post_live_state(&self, state: &LiveState) -> Result<(), String> {
+        self.post_json(&state.to_json())
+    }
+
+    fn post_json(&self, json: &str) -> Result<(), String> {
+        let Transport::Parent { parent, origin, .. } = &self.transport else { return Err("live needs ?host=parent".into()) };
+        let message = js_sys::JSON::parse(json).map_err(|_| "couldn't build the message".to_string())?;
+        parent.post_message(&message, origin).map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
     }
 
     /// Unsaved changes appeared or went away. Repeats of the last state reported are not sent.

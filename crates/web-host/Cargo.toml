@@ -7,6 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[dependencies]
+serde_json = { workspace = true }
+
 # Already in every web build's Cargo.lock through eframe.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

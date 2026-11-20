@@ -23,6 +23,17 @@ The crate has two parts:
 
 With `?host=parent` a message is an object with `type` (`pdfcraft:open`) and the fields, sent with same-origin `postMessage`; `bytes` go as a transferred `ArrayBuffer`. With `data-host="page"` it is a `CustomEvent` of that type on the canvas, with the fields in `detail`.
 
+### Live collaboration (`craft-live/1`)
+
+Unprefixed, parent mode only, spoken by the Nextcloud page. The host waits for an unprefixed `{type:"ready"}` (`post_live_ready`; the page also posts after the iframe loads), then posts the grant; `listen_live` hears it.
+
+| Type | Direction | Fields |
+|---|---|---|
+| `live` | host → app | `ticket`, `relayUrl` (absolute `ws(s)://`), `room`, `fileUrl`, `fileName`, `proto: "craft-live/1"` |
+| `live-state` | app → host | `state` (`connecting`, `live`, `readonly`, `reconnecting`, `refused`), `reason?`, `savedAt?`, `peers` (`[{id, display}]`) |
+
+An unknown `proto` is a typed `LiveError::UnsupportedProto`, never a panic. The ticket is a credential: `LiveMessage`'s `Debug` hides it and the app must not log it. The host sends a fresh `live` before the ticket expires; treat each one as authoritative.
+
 Compatibility with the bridges shipped before this crate:
 
 - Fields marked `?` are optional. A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats its save as done once it is posted.
