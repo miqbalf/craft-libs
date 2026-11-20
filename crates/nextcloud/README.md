@@ -22,7 +22,7 @@ borrowed from a later `PROPFIND`.
 `search` and `shared_with_me` are tested against in-memory fakes only; neither has been run
 against a live Nextcloud. The `SEARCH` body follows Nextcloud's documented `d:basicsearch`, and the
 share fields follow the OCS sharing API, so check both on a real server before relying on them.
-A shared entry's `path` has no leading slash, unlike `list` and `search`.
+Paths from `shared_with_me` carry a leading slash, as `list` and `search` paths do.
 
 ## Multistatus parsing
 

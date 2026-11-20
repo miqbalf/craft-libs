@@ -337,7 +337,7 @@ fn shared_with_me_maps_ocs_shares() {
 
     assert_eq!(entries.len(), 2);
     let (file, folder) = (&entries[0], &entries[1]);
-    assert_eq!(file.path, "Shared/report.docx");
+    assert_eq!(file.path, "/Shared/report.docx");
     assert_eq!(file.name, "report.docx");
     assert_eq!(file.kind, craft_cloud::EntryKind::File);
     assert_eq!(folder.kind, craft_cloud::EntryKind::Folder);
@@ -352,6 +352,20 @@ fn shared_with_me_maps_ocs_shares() {
     assert!(file.writable && !folder.writable);
     // The room is stable across a rename, so it is the file id, not the path.
     assert_eq!(file.room, "4711");
+}
+
+#[test]
+fn shared_path_and_id_match_list_form() {
+    let http = Fake::new(vec![Response::new(200, SHARES)]);
+    let shared = Files::new(&account()).shared_with_me(&http).unwrap();
+    let listed_item = item("/remote.php/dav/files/u/Shared/report.docx", "<d:resourcetype/>");
+    let http = Fake::new(vec![multistatus(&format!(
+        "{}{listed_item}",
+        item("/remote.php/dav/files/u/Shared/", "<d:resourcetype><d:collection/></d:resourcetype>")
+    ))]);
+    let listed = Files::new(&account()).list(&http, "/Shared").unwrap();
+    assert_eq!(shared[0].path, listed[0].path);
+    assert_eq!(shared[0].id, listed[0].id);
 }
 
 #[test]

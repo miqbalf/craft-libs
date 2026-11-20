@@ -152,7 +152,7 @@ impl<'a> Files<'a> {
     }
 
     /// Items other people shared with this user, from the OCS sharing API. Paths are the ones in
-    /// this user's own files, without the leading slash.
+    /// this user's own files, with a leading slash as `list` gives them.
     pub fn shared_with_me<H: Http>(&self, http: &H) -> Result<Vec<Entry>> {
         let url = format!("{}/ocs/v2.php/apps/files_sharing/api/v1/shares?shared_with_me=true&format=json", self.account.base());
         let req = self.account.request(Method::Get, url).header("accept", "application/json");
@@ -297,10 +297,12 @@ impl<'a> Files<'a> {
 ///
 /// OCS permissions are a bitmask: 2 is update, 4 create. A share that omits them is read-only.
 fn share_entry(share: &serde_json::Value) -> Option<Entry> {
-    let path = share.get("path")?.as_str()?.trim_start_matches('/').to_owned();
-    if path.is_empty() {
+    let relative = share.get("path")?.as_str()?.trim_matches('/');
+    if relative.is_empty() {
         return None;
     }
+    // The same form `list` and `search` give, so a path and an id mean the same across sources.
+    let path = format!("/{relative}");
     let text = |key: &str| share.get(key).and_then(serde_json::Value::as_str).map(str::to_owned).filter(|t| !t.is_empty());
     let number = |key: &str| share.get(key).and_then(serde_json::Value::as_i64);
     let is_dir = share.get("item_type").and_then(serde_json::Value::as_str) == Some("folder");
