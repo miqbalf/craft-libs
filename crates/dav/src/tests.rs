@@ -71,6 +71,25 @@ fn depth_node_and_attribute_counts_are_bounded() {
     assert!(parse_multistatus(format!("<multistatus xmlns='DAV:'><response{attrs}/></multistatus>").as_bytes()).is_err());
 }
 
+#[test]
+fn limits_can_be_raised_or_lowered_per_call() {
+    let many = format!("<multistatus xmlns='DAV:'>{}</multistatus>", "<response/>".repeat(MAX_NODES));
+    let wide = Limits { max_nodes: 4 * MAX_NODES, ..Limits::default() };
+    assert!(parse_multistatus(many.as_bytes()).is_err());
+    assert_eq!(responses(&parse_multistatus_with(many.as_bytes(), wide).unwrap()).count(), MAX_NODES);
+
+    let small = b"<multistatus xmlns='DAV:'><response/></multistatus>";
+    assert!(parse_multistatus_with(small, Limits { max_bytes: small.len() - 1, ..Limits::default() }).is_err());
+    assert!(
+        parse_multistatus_with(&vec![b' '; MAX_BYTES + 1], Limits { max_bytes: 2 * MAX_BYTES, ..Limits::default() })
+            .is_err_and(|e| !matches!(e, Error::Xml(craft_xml::Error::TooLarge(_))))
+    );
+
+    let deep = format!("<multistatus xmlns='DAV:'>{}</multistatus>", "<x>".repeat(4) + &"</x>".repeat(4));
+    assert!(parse_multistatus(deep.as_bytes()).is_ok());
+    assert!(parse_multistatus_with(deep.as_bytes(), Limits { max_depth: 3, ..Limits::default() }).is_err());
+}
+
 proptest! {
     #[test]
     fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {

@@ -4,7 +4,8 @@
 //! WebDAV multistatus documents (RFC 4918 §13), what a server answers a `PROPFIND` or a CalDAV or
 //! CardDAV `REPORT` with.
 //!
-//! [`parse_multistatus`] reads the bytes into a [`craft_xml::El`] tree whose names carry fixed
+//! [`parse_multistatus`] reads the bytes within the default limits, and [`parse_multistatus_with`]
+//! within limits the caller picks. Either reads them into a [`craft_xml::El`] tree whose names carry fixed
 //! prefixes whatever the document used: `d:` for `DAV:` ([`DAV`]), `c:` for CalDAV ([`CALDAV`]),
 //! `card:` for CardDAV ([`CARDDAV`]), `cs:` for CalendarServer ([`CALENDARSERVER`]), `oc:` and
 //! `nc:` for ownCloud and Nextcloud ([`OWNCLOUD`], [`NEXTCLOUD`]); a name in any other namespace
@@ -15,7 +16,7 @@
 //! text outside the root, a root that is not `d:multistatus` and anything past the limits make
 //! the whole document an error; a partial tree is never returned.
 
-use craft_xml::{Canonical, Doctype, El, Limits, Options};
+use craft_xml::{Canonical, Doctype, El, Options};
 
 /// The WebDAV namespace.
 pub const DAV: &str = "DAV:";
@@ -64,21 +65,50 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Read one UTF-8 multistatus document (see the crate's documentation). The root is named
-/// `d:multistatus`; namespace declarations are not kept as attributes.
+/// How much of a document [`parse_multistatus_with`] will read. The [`Default`] is
+/// [`MAX_BYTES`], [`MAX_NODES`] and [`MAX_DEPTH`], what [`parse_multistatus`] uses.
+///
+/// Raise them for a server answer known to be large, such as a folder listing with tens of
+/// thousands of entries; a tree node costs about 72 bytes before its strings, so `max_nodes`
+/// bounds memory as much as `max_bytes` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Most bytes of a document.
+    pub max_bytes: usize,
+    /// Most nodes (elements and stretches of text).
+    pub max_nodes: usize,
+    /// Deepest nesting of elements, the root at 1.
+    pub max_depth: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { max_bytes: MAX_BYTES, max_nodes: MAX_NODES, max_depth: MAX_DEPTH }
+    }
+}
+
+/// Read one UTF-8 multistatus document (see the crate's documentation) within the default
+/// [`Limits`]. The root is named `d:multistatus`; namespace declarations are not kept as
+/// attributes.
 pub fn parse_multistatus(bytes: &[u8]) -> Result<El, Error> {
-    if bytes.len() > MAX_BYTES {
-        return Err(Error::Xml(craft_xml::Error::TooLarge(MAX_BYTES)));
+    parse_multistatus_with(bytes, Limits::default())
+}
+
+/// As [`parse_multistatus`], within `limits`. The attribute limits stay at [`MAX_ATTRS`] and
+/// [`MAX_ATTRS_TOTAL`].
+pub fn parse_multistatus_with(bytes: &[u8], limits: Limits) -> Result<El, Error> {
+    if bytes.len() > limits.max_bytes {
+        return Err(Error::Xml(craft_xml::Error::TooLarge(limits.max_bytes)));
     }
     let text = std::str::from_utf8(bytes).map_err(|_| Error::Characters)?;
     if !text.chars().all(craft_xml::is_xml_char) {
         return Err(Error::Characters);
     }
-    let limits = Limits {
-        max_input: MAX_BYTES,
-        max_depth: MAX_DEPTH,
-        max_nodes: MAX_NODES,
-        max_elements: MAX_NODES,
+    let limits = craft_xml::Limits {
+        max_input: limits.max_bytes,
+        max_depth: limits.max_depth,
+        max_nodes: limits.max_nodes,
+        max_elements: limits.max_nodes,
         max_attrs: MAX_ATTRS,
         max_attrs_total: MAX_ATTRS_TOTAL,
     };
