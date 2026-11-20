@@ -180,3 +180,13 @@ Sanitization, animation fitting and numeric output policy remain caller-owned.
 `crates/xfdf` extracts PDFCraft field reading from #5937 refresh `cb564fd827f572818e9ddb0ea5989a432b1f39fd` (MIT OR Apache-2.0). App-side annotation and form policy remains local; source history is retained in the original repository.
 
 Retained XFDF source contributors (move-aware blame): Brandon Thomas, Marco Arnulfo, pkibiego and storybored379; module split by aiongg. Subsequent budget/integration work by Dylan M. Taylor.
+
+## Nextcloud client
+
+`crates/nextcloud` is extracted from collab-craft `crates/nextcloud` at
+[d8cd69c](https://github.com/wdunn001/collab-craft/tree/d8cd69cbf9e4ee1950ba1b2dc5d0002eee639e32/crates/nextcloud)
+(MIT OR Apache-2.0; Copyright (c) 2026 ArtCraft Team and the craft-libs contributors, as in that
+repository's `LICENSE-MIT`): `http.rs`, `login.rs`, `dav.rs`, `error.rs` and the `Account` part of
+`lib.rs`. Changed: multistatus is read with `craft-dav`, entries are `craft_cloud::Entry`, `create`
+sends `If-None-Match: *`, `put` returns the ETag of its own write, locks can be refreshed, and the
+sharing, contacts, mail and provider modules are left out.

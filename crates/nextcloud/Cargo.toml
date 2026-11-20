@@ -1,0 +1,19 @@
+[package]
+name = "craft-nextcloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Nextcloud WebDAV files, locking and Login Flow v2 as request builders and response parsers over a caller-supplied transport"
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-cloud = { workspace = true }
+craft-dav = { workspace = true }
+craft-xml = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
