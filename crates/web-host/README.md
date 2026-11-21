@@ -15,7 +15,9 @@ The crate has two parts:
 | `host` | host → app | `version`, `handoff?` | what the host supports; `handoff: true` means it routes hand-offs |
 | `open` | host → app | `name`, and `bytes` or `file` + `size` | open a document as File › Open would |
 | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` | Save, Save As or Export: the host stores the file |
-| `saved` | host → app | `id` | the save with that `id` is stored; the app clears dirty |
+| `saved` | host → app | `id`, `name?` | the save with that `id` is stored; the app clears dirty and takes `name` when the host kept it under another name |
+| `save-failed` | host → app | `id`, `error` | the host could not store that save; the app stays unsaved and shows `error` |
+| `fonts` | host → app | `fonts` (`[{name, url}]`) | same-origin font files to fetch (`web::fetch_font`) and install; at most 64 entries, 20 MB each |
 | `dirty` | app → host | `dirty` | unsaved changes appeared or went away |
 | `failed` | app → host | `error`, `id?` | a document or a save could not be taken |
 | `handoff` | app → host | `name`, and `bytes` or `file` + `size` | this file belongs to another app |
@@ -36,6 +38,7 @@ An unknown `proto` is a typed `LiveError::UnsupportedProto`, never a panic. The 
 
 Compatibility with the bridges shipped before this crate:
 
+- `host` may carry `saves: true`: the host stores saves, so the app sends `save` with an `id` (`PendingSaves::start`) and marks the document saved only when `saved` arrives for it (`PendingSaves::finish`). Without `saves` the app keeps its earlier behaviour (download, never marked saved). A live document is saved by its live session, not by `save`.
 - Fields marked `?` are optional. A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats its save as done once it is posted.
 - A host that never sends `host` gets the behaviour of the earlier bridges.
 - `size` beside `file` is for hosts and older bridges; this crate takes a `Blob`'s length from the `Blob` itself.

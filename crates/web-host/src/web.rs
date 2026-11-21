@@ -15,7 +15,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::js_sys;
 
 use crate::live::{LIVE_TYPE, LiveError, LiveMessage, LiveState, READY_JSON};
-use crate::{Inbox, Incoming, Mode, Outgoing, VERSION, file_name, message_type};
+use crate::{FontRef, Inbox, Incoming, Mode, Outgoing, VERSION, file_name, message_type};
 
 /// A file the host passes in, not yet copied into the app's memory: check its size first.
 pub enum FileData {
@@ -37,15 +37,20 @@ impl FileData {
 
 /// A message from the host.
 pub enum Message {
-    /// What the host supports; `handoff`: it routes files the app hands off.
-    Host { version: String, handoff: bool },
+    /// What the host supports; `handoff`: it routes files the app hands off; `saves`: it stores
+    /// saves, so the app sends `save` with an id and trusts only `saved`.
+    Host { version: String, handoff: bool, saves: bool },
     /// Open a document as File › Open would. `name` is already cleaned ([`crate::file_name`]).
     Open { name: String, data: FileData },
     /// Attach one PDF page to the current drawing without opening another document.
     /// Bytes stay a view until the app checks their length. Page numbers start at one.
     AttachPdf { name: String, bytes: js_sys::Uint8Array, page: u32, insertion: [f64; 3], width: f64, height: f64 },
-    /// The save with this `id` is stored.
-    Saved { id: String },
+    /// The save with this `id` is stored; `name` is set when the host kept it under another name.
+    Saved { id: String, name: Option<String> },
+    /// The host could not store the save with this `id`.
+    SaveFailed { id: String, error: String },
+    /// Same-origin fonts to fetch ([`fetch_font`]) and install. At most [`crate::MAX_FONTS`].
+    Fonts { fonts: Vec<FontRef> },
     /// The host gave a handed-off file to the app that edits it.
     HandoffDone { name: String, app: String },
 }
@@ -249,6 +254,7 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
         Incoming::Host => Message::Host {
             version: string(data, "version").unwrap_or_else(|| VERSION.to_string()),
             handoff: get(data, "handoff").as_bool() == Some(true),
+            saves: get(data, "saves").as_bool() == Some(true),
         },
         Incoming::Open => {
             let name = file_name(string(data, "name").as_deref(), "document");
@@ -279,11 +285,54 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
                 height,
             }
         }
-        Incoming::Saved => Message::Saved { id: string(data, "id")? },
+        Incoming::Saved => {
+            Message::Saved { id: string(data, "id")?, name: string(data, "name").map(|n| file_name(Some(&n), "")).filter(|n| !n.is_empty()) }
+        }
+        Incoming::SaveFailed => {
+            Message::SaveFailed { id: string(data, "id")?, error: string(data, "error").unwrap_or_else(|| "the host could not save".to_string()) }
+        }
+        Incoming::Fonts => {
+            let list = get(data, "fonts").dyn_into::<js_sys::Array>().ok()?;
+            let origin = web_sys::window().and_then(|w| w.location().origin().ok()).unwrap_or_default();
+            let entries: Vec<(Option<String>, Option<String>)> = (0..list.length().min(crate::MAX_FONTS as u32))
+                .map(|i| {
+                    let entry = list.get(i);
+                    (string(&entry, "name"), string(&entry, "url"))
+                })
+                .collect();
+            Message::Fonts { fonts: crate::font_list(entries.iter().map(|(n, u)| (n.as_deref(), u.as_deref())), &origin) }
+        }
         Incoming::HandoffDone => {
             Message::HandoffDone { name: string(data, "name").unwrap_or_default(), app: string(data, "app").unwrap_or_default() }
         }
     })
+}
+
+/// Fetch a font a `fonts` message offered: the bytes of `font.url`, or why not. Only a same-origin
+/// URL is fetched, with the page's own credentials; a response over [`crate::MAX_FONT_BYTES`]
+/// (by its `Content-Length` or its real length) is refused.
+pub async fn fetch_font(font: &FontRef) -> Result<Vec<u8>, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let origin = window.location().origin().map_err(|_| "no origin".to_string())?;
+    if !crate::is_same_origin(&font.url, &origin) {
+        return Err(format!("{} is not on this origin", font.name));
+    }
+    let error = |e: JsValue| e.as_string().unwrap_or_else(|| format!("{e:?}"));
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&font.url)).await.map_err(error)?;
+    let response: web_sys::Response = response.dyn_into().map_err(|_| "not a response".to_string())?;
+    if !response.ok() {
+        return Err(format!("{}: HTTP {}", font.name, response.status()));
+    }
+    let declared = response.headers().get("content-length").ok().flatten().and_then(|v| v.parse::<f64>().ok());
+    if declared.is_some_and(|len| len > crate::MAX_FONT_BYTES as f64) {
+        return Err(format!("{} is too large", font.name));
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(response.array_buffer().map_err(error)?).await.map_err(error)?;
+    let bytes = js_sys::Uint8Array::new(&buffer);
+    if !crate::font_size_ok(f64::from(bytes.length())) {
+        return Err(format!("{} is empty or too large", font.name));
+    }
+    Ok(bytes.to_vec())
 }
 
 /// `file` (a `Blob`; its `size` field is ignored for the Blob's own) or `bytes` (an `ArrayBuffer` or `Uint8Array`), not copied.
@@ -475,7 +524,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn a_saved_needs_a_string_id() {
-        assert!(matches!(read(Incoming::Saved, &obj(&[("id", "s1".into())])), Some(Message::Saved { id }) if id == "s1"));
+        assert!(matches!(read(Incoming::Saved, &obj(&[("id", "s1".into())])), Some(Message::Saved { id, name: None }) if id == "s1"));
         for data in [obj(&[]), obj(&[("id", 3.into())]), JsValue::NULL, JsValue::from_str("s1")] {
             assert!(read(Incoming::Saved, &data).is_none());
         }
@@ -485,15 +534,82 @@ mod tests {
     fn a_host_message_and_a_handoff_done_read_whatever_fields_exist() {
         // Nothing required: a missing version is the contract's, `handoff` is true only for `true`.
         for data in [JsValue::NULL, obj(&[]), obj(&[("handoff", "yes".into())]), obj(&[("handoff", 1.into())])] {
-            let Some(Message::Host { version, handoff }) = read(Incoming::Host, &data) else { panic!("a host message is read") };
+            let Some(Message::Host { version, handoff, saves }) = read(Incoming::Host, &data) else { panic!("a host message is read") };
             assert_eq!(version, crate::VERSION);
             assert!(!handoff);
+            assert!(!saves);
         }
         assert!(matches!(read(Incoming::Host, &obj(&[("handoff", true.into())])), Some(Message::Host { handoff: true, .. })));
+        assert!(matches!(read(Incoming::Host, &obj(&[("saves", true.into())])), Some(Message::Host { saves: true, .. })));
+        for not_true in [JsValue::from("true"), 1.into(), false.into(), JsValue::NULL] {
+            assert!(
+                matches!(read(Incoming::Host, &obj(&[("saves", not_true)])), Some(Message::Host { saves: false, .. })),
+                "saves is true only for true"
+            );
+        }
         assert!(matches!(
             read(Incoming::HandoffDone, &obj(&[("name", "a.pdf".into()), ("app", "pdfcraft".into())])),
             Some(Message::HandoffDone { name, app }) if name == "a.pdf" && app == "pdfcraft"
         ));
         assert!(matches!(read(Incoming::HandoffDone, &JsValue::NULL), Some(Message::HandoffDone { name, app }) if name.is_empty() && app.is_empty()));
+    }
+
+    #[wasm_bindgen_test]
+    fn a_saved_may_carry_a_clean_name() {
+        let name = |v: JsValue| match read(Incoming::Saved, &obj(&[("id", "s1".into()), ("name", v)])) {
+            Some(Message::Saved { name, .. }) => name,
+            _ => panic!("a saved is read"),
+        };
+        assert_eq!(name("a (conflict).docx".into()).as_deref(), Some("a (conflict).docx"));
+        assert_eq!(name("../../b.docx".into()).as_deref(), Some("b.docx"));
+        assert_eq!(name("".into()), None, "an empty name is no name");
+        assert_eq!(name(5.into()), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn a_save_failed_needs_an_id_and_has_an_error() {
+        let Some(Message::SaveFailed { id, error }) = read(Incoming::SaveFailed, &obj(&[("id", "s2".into()), ("error", "quota".into())])) else {
+            panic!("a save-failed is read");
+        };
+        assert_eq!((id.as_str(), error.as_str()), ("s2", "quota"));
+        let Some(Message::SaveFailed { error, .. }) = read(Incoming::SaveFailed, &obj(&[("id", "s2".into())])) else { panic!("read") };
+        assert!(!error.is_empty(), "an error is always something to show");
+        for data in [obj(&[("error", "x".into())]), obj(&[("id", 3.into())]), JsValue::NULL] {
+            assert!(read(Incoming::SaveFailed, &data).is_none());
+        }
+    }
+
+    fn font(name: &str, url: &str) -> JsValue {
+        obj(&[("name", name.into()), ("url", url.into())])
+    }
+
+    #[wasm_bindgen_test]
+    fn fonts_keep_same_origin_entries_and_are_capped() {
+        let origin = web_sys::window().unwrap().location().origin().unwrap();
+        let list = js_sys::Array::new();
+        list.push(&font("Barlow", "/f/barlow.ttf"));
+        list.push(&font("Evil", "https://evil.example/e.ttf"));
+        list.push(&font("Full", &format!("{origin}/f/full.ttf")));
+        list.push(&JsValue::NULL);
+        let Some(Message::Fonts { fonts }) = read(Incoming::Fonts, &obj(&[("fonts", list.into())])) else { panic!("fonts are read") };
+        let names: Vec<_> = fonts.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["Barlow", "Full"]);
+
+        let many = js_sys::Array::new();
+        for i in 0..(crate::MAX_FONTS + 10) {
+            many.push(&font("n", &format!("/f/{i}.ttf")));
+        }
+        let Some(Message::Fonts { fonts }) = read(Incoming::Fonts, &obj(&[("fonts", many.into())])) else { panic!("fonts are read") };
+        assert_eq!(fonts.len(), crate::MAX_FONTS);
+
+        for data in [obj(&[]), obj(&[("fonts", "Barlow".into())]), JsValue::NULL] {
+            assert!(read(Incoming::Fonts, &data).is_none(), "fonts must be a list");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_font_off_this_origin_is_never_fetched() {
+        let font = FontRef { name: "Evil".into(), url: "https://evil.example/e.ttf".into() };
+        assert!(fetch_font(&font).await.is_err());
     }
 }

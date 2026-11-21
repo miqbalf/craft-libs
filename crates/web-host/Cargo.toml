@@ -13,7 +13,8 @@ serde_json = { workspace = true }
 # Already in every web build's Cargo.lock through eframe.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["Blob", "CustomEvent", "CustomEventInit", "Element", "Event", "EventTarget", "Location", "MessageEvent", "Window"] }
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Blob", "CustomEvent", "CustomEventInit", "Element", "Event", "EventTarget", "Headers", "Location", "MessageEvent", "Response", "Window"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
