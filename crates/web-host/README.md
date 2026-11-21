@@ -30,7 +30,7 @@ Unprefixed, parent mode only, spoken by the Nextcloud page. The host waits for a
 | Type | Direction | Fields |
 |---|---|---|
 | `live` | host → app | `ticket`, `relayUrl` (absolute `ws(s)://`), `room`, `fileUrl`, `fileName`, `proto: "craft-live/1"` |
-| `live-state` | app → host | `state` (`connecting`, `live`, `readonly`, `reconnecting`, `refused`), `reason?`, `savedAt?`, `peers` (`[{id, display}]`) |
+| `live-state` | app → host | `state` (`connecting`, `live`, `readonly`, `reconnecting`, `refused`, `broken`: ended for good, reopen), `reason?`, `savedAt?`, `peers` (`[{id, display}]`) |
 
 An unknown `proto` is a typed `LiveError::UnsupportedProto`, never a panic. The ticket is a credential: `LiveMessage`'s `Debug` hides it and the app must not log it. The host sends a fresh `live` before the ticket expires; treat each one as authoritative.
 

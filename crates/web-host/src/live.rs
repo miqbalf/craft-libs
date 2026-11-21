@@ -142,7 +142,11 @@ pub enum LiveStatus {
     Live,
     Readonly,
     Reconnecting,
+    /// Nothing can be shared now (the relay refused the connection or has no room); may pass.
     Refused,
+    /// The session ended for good (out of step, saving stopped, the room closed or changed):
+    /// the user must reopen the file.
+    Broken,
 }
 
 impl LiveStatus {
@@ -153,11 +157,12 @@ impl LiveStatus {
             Self::Readonly => "readonly",
             Self::Reconnecting => "reconnecting",
             Self::Refused => "refused",
+            Self::Broken => "broken",
         }
     }
 
     fn from_str(s: &str) -> Option<Self> {
-        [Self::Connecting, Self::Live, Self::Readonly, Self::Reconnecting, Self::Refused].into_iter().find(|v| v.as_str() == s)
+        [Self::Connecting, Self::Live, Self::Readonly, Self::Reconnecting, Self::Refused, Self::Broken].into_iter().find(|v| v.as_str() == s)
     }
 }
 
@@ -285,7 +290,7 @@ mod tests {
         assert_eq!(LiveState::parse(&json), Ok(state));
         let bare = LiveState::parse(r#"{"type":"live-state","state":"live","peers":[]}"#).expect("optional fields");
         assert_eq!((bare.reason, bare.saved_at), (None, None));
-        for s in ["connecting", "live", "readonly", "reconnecting", "refused"] {
+        for s in ["connecting", "live", "readonly", "reconnecting", "refused", "broken"] {
             assert!(LiveState::parse(&format!(r#"{{"type":"live-state","state":"{s}","peers":[]}}"#)).is_ok(), "{s}");
         }
         assert!(LiveState::parse(r#"{"type":"live-state","state":"weird","peers":[]}"#).is_err());
