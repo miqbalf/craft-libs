@@ -376,6 +376,7 @@ fn the_folder_itself_maps_to_its_target() {
 
 const DOMAIN: &str = "11111111-2222-3333-4444-555555555555";
 const MAC_CFG: &str = "/Users/alice/Library/Containers/com.nextcloud.desktopclient/Data/Library/Preferences/Nextcloud/nextcloud.cfg";
+const FP: &str = "com.nextcloud.desktopclient.FileProviderExt/";
 const CLOUD: &str = "/Users/alice/Library/CloudStorage/Nextcloud-cloud.example.org-alice";
 
 fn file_provider() -> Fake {
@@ -397,9 +398,9 @@ fn a_stale_or_foreign_file_provider_folder_has_no_nextcloud() {
     assert_eq!(desktop_route_in(&format!("{CLOUD}/a.docx"), &stale), ShareRoute::None, "a domain the config doesn't name");
     let none = file_provider();
     assert_eq!(desktop_route_in(&format!("{CLOUD}/a.docx"), &none), ShareRoute::None, "no attribute");
-    let deeper = file_provider().xattr(&format!("{CLOUD}/Docs"), &format!("x/{DOMAIN}"));
+    let deeper = file_provider().xattr(&format!("{CLOUD}/Docs"), &format!("{FP}{DOMAIN}"));
     assert_eq!(desktop_route_in(&format!("{CLOUD}/Docs/a.docx"), &deeper), ShareRoute::None, "only a folder directly in CloudStorage is a domain");
-    let elsewhere = file_provider().xattr("/Users/alice/Documents", &format!("x/{DOMAIN}"));
+    let elsewhere = file_provider().xattr("/Users/alice/Documents", &format!("{FP}{DOMAIN}"));
     assert_eq!(desktop_route_in("/Users/alice/Documents/a.docx", &elsewhere), ShareRoute::None, "outside CloudStorage");
 }
 
@@ -414,16 +415,20 @@ fn the_file_provider_is_only_asked_on_a_mac() {
 
 #[test]
 fn the_sharing_url_opens_the_files_folder() {
-    assert_eq!(sharing_url("https://cloud.example.org/", "/Work/Q3 report.docx"), "https://cloud.example.org/apps/files/?dir=/Work");
-    assert_eq!(sharing_url("https://other.example.net/nextcloud", "/a.docx"), "https://other.example.net/nextcloud/apps/files/?dir=/");
-    assert_eq!(sharing_url("https://cloud.example.org", "/"), "https://cloud.example.org/apps/files/?dir=/");
+    assert_eq!(sharing_url("https://cloud.example.org/", "/Work/Q3 report.docx"), "https://cloud.example.org/index.php/apps/files/?dir=/Work");
+    assert_eq!(sharing_url("https://other.example.net/nextcloud", "/a.docx"), "https://other.example.net/nextcloud/index.php/apps/files/?dir=/");
+    assert_eq!(sharing_url("https://cloud.example.org", "/"), "https://cloud.example.org/index.php/apps/files/?dir=/");
 }
 
 #[test]
 fn the_sharing_url_encodes_every_path_part() {
     let url = sharing_url("https://cloud.example.org", "/Ünï & co/50%+#?=x/a b.docx");
-    assert_eq!(url, "https://cloud.example.org/apps/files/?dir=/%C3%9Cn%C3%AF%20%26%20co/50%25%2B%23%3F%3Dx");
-    assert_eq!(sharing_url("https://cloud.example.org", "//a//b.docx"), "https://cloud.example.org/apps/files/?dir=/a", "empty parts dropped");
+    assert_eq!(url, "https://cloud.example.org/index.php/apps/files/?dir=/%C3%9Cn%C3%AF%20%26%20co/50%25%2B%23%3F%3Dx");
+    assert_eq!(
+        sharing_url("https://cloud.example.org", "//a//b.docx"),
+        "https://cloud.example.org/index.php/apps/files/?dir=/a",
+        "empty parts dropped"
+    );
 }
 
 #[test]
@@ -439,4 +444,98 @@ fn a_route_survives_json() {
         let json = serde_json::to_string(&route).expect("serialises");
         assert_eq!(serde_json::from_str::<ShareRoute>(&json).expect("parses"), route);
     }
+}
+
+// ---- fix round 1 ----
+
+#[test]
+fn a_server_url_with_userinfo_query_fragment_or_backslash_is_refused() {
+    for bad in [
+        "https://alice:pw@cloud.example.org",
+        "https://cloud.example.org@evil.example.com",
+        "https://cloud.example.org?a=b",
+        "https://cloud.example.org/nc?x",
+        "https://cloud.example.org#x",
+        "https://cloud.example.org/nc#x",
+        "https://cloud.example.org\\evil",
+        "https:///nextcloud",
+        "HTTPS://cloud.example.org:443:1/",
+    ] {
+        let text = format!("[Accounts]\n0\\url={bad}\n0\\Folders\\1\\localPath=/home/alice/Nextcloud\n");
+        assert!(parse(&text).accounts.is_empty(), "{bad:?} must not be a server");
+        assert_eq!(desktop_route_in("/home/alice/Nextcloud/a.docx", &linux(&text)), ShareRoute::None, "{bad:?}");
+    }
+    for good in ["https://cloud.example.org:8443/nextcloud/", "http://192.0.2.7", "https://[2001:db8::1]:8443"] {
+        let text = format!("[Accounts]\n0\\url={good}\n");
+        assert_eq!(parse(&text).accounts.len(), 1, "{good:?} is a server");
+    }
+}
+
+#[test]
+fn the_sharing_url_goes_through_index_php() {
+    // Works with and without pretty URLs; a subpath install keeps its subpath.
+    let url = sharing_url("https://other.example.net/nextcloud", "/Work/a.docx");
+    assert!(url.starts_with("https://other.example.net/nextcloud/index.php/apps/files/?dir="), "{url}");
+}
+
+#[test]
+fn a_file_provider_id_of_another_app_does_not_match() {
+    let other = file_provider().xattr(CLOUD, &format!("com.example.otherprovider.Ext/{DOMAIN}"));
+    assert_eq!(desktop_route_in(&format!("{CLOUD}/a.docx"), &other), ShareRoute::None);
+    let bare = file_provider().xattr(CLOUD, DOMAIN);
+    assert_eq!(desktop_route_in(&format!("{CLOUD}/a.docx"), &bare), ShareRoute::None, "no prefix at all");
+}
+
+#[test]
+fn dot_dot_without_a_canonical_path_has_no_nextcloud() {
+    // Lexically inside the synced folder, but through a part that may be a symlink elsewhere.
+    let env = linux(CLASSIC);
+    assert_eq!(desktop_route_in("/home/alice/Projects/linkdir/../a.md", &env), ShareRoute::None);
+    // Once the OS resolved it, the real path decides.
+    let env = linux(CLASSIC).link("/home/alice/Projects/linkdir/../a.md", "/home/alice/Projects/a.md");
+    assert_eq!(desktop_route_in("/home/alice/Projects/linkdir/../a.md", &env), desktop("https://cloud.example.org", "alice", "/Work/Projects/a.md"));
+}
+
+#[test]
+fn a_symlink_inside_a_folder_that_points_outside_is_outside() {
+    let env = linux(CLASSIC).link("/home/alice/Nextcloud/escape.docx", "/home/alice/Private/escape.docx");
+    assert_eq!(desktop_route_in("/home/alice/Nextcloud/escape.docx", &env), ShareRoute::None);
+}
+
+#[test]
+fn target_paths_keep_backslashes_off_windows_and_refuse_dot_dot() {
+    let text = "[Accounts]\n0\\url=https://cloud.example.org\n0\\Folders\\1\\localPath=/home/alice/Nextcloud\n0\\Folders\\1\\targetPath=/A\\\\B\n";
+    assert_eq!(desktop_route_in("/home/alice/Nextcloud/x.md", &linux(text)), desktop("https://cloud.example.org", "", "/A\\B/x.md"));
+    let climb = "[Accounts]\n0\\url=https://cloud.example.org\n0\\Folders\\1\\localPath=/home/alice/Nextcloud\n0\\Folders\\1\\targetPath=/a/../b\n";
+    assert_eq!(desktop_route_in("/home/alice/Nextcloud/x.md", &linux(climb)), ShareRoute::None);
+    // Windows-written targets may use either separator.
+    let win = "[Accounts]\n0\\url=https://cloud.example.org\n0\\Folders\\1\\localPath=C:/NC\n0\\Folders\\1\\targetPath=\\\\Team\\\\Docs\n";
+    let env = Fake::new(Platform::Windows, "C:\\Users\\alice").var("APPDATA", "C:\\AD").file("C:\\AD\\Nextcloud\\nextcloud.cfg", win);
+    assert_eq!(desktop_route_in("C:\\NC\\x.md", &env), desktop("https://cloud.example.org", "", "/Team/Docs/x.md"));
+}
+
+#[test]
+fn surrogate_pairs_decode_and_a_lone_one_drops_only_its_value() {
+    let text = "[Accounts]\n0\\url=https://cloud.example.org\n0\\Folders\\1\\localPath=/home/alice/\\xd83d\\xde00\n0\\Folders\\2\\localPath=/home/alice/\\xd83dX\n0\\Folders\\3\\localPath=/home/alice/ok\n";
+    let locals: Vec<_> = parse(text).accounts[0].folders.iter().map(|f| f.local_path.clone()).collect();
+    assert!(locals.contains(&"/home/alice/\u{1F600}".to_string()), "{locals:?}");
+    assert!(locals.contains(&"/home/alice/ok".to_string()), "{locals:?}");
+    assert_eq!(locals.len(), 2, "the lone surrogate's folder alone is dropped: {locals:?}");
+}
+
+#[test]
+fn the_system_env_refuses_a_config_over_the_cap() {
+    use crate::SystemEnv;
+    use crate::config::MAX_CONFIG_BYTES;
+    let dir = std::env::temp_dir().join(format!("craft-share-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let small = dir.join("small.cfg");
+    let big = dir.join("big.cfg");
+    std::fs::write(&small, "[Accounts]\n").expect("write");
+    std::fs::write(&big, vec![b'a'; usize::try_from(MAX_CONFIG_BYTES).expect("fits") + 1]).expect("write");
+    let read = |p: &std::path::Path| SystemEnv.read_config(p.to_str().expect("utf-8"));
+    assert!(read(&small).is_some());
+    assert!(read(&big).is_none());
+    assert!(read(&dir).is_none(), "a folder is not a config");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -168,7 +168,7 @@ fn index(text: &str) -> Option<u32> {
 }
 
 /// A QSettings .ini value as text: surrounding quotes dropped, `\\`, `\"`, `\t`, `\n`, `\r`, `\0`
-/// and `\xNNNN` (up to four hex digits) decoded. `None` for typed values (`@Variant(...)`,
+/// and `\xNNNN` (up to four hex digits; a UTF-16 surrogate pair as two escapes) decoded. `None` for typed values (`@Variant(...)`,
 /// `@ByteArray(...)`, anything starting with `@`) and for a broken escape.
 fn decode(value: &str) -> Option<String> {
     let value = match value.strip_prefix('"') {
@@ -193,18 +193,20 @@ fn decode(value: &str) -> Option<String> {
             'r' => out.push('\r'),
             '0' => out.push('\0'),
             'x' => {
-                let mut code = 0u32;
-                let mut digits = 0;
-                while digits < 4
-                    && let Some(d) = chars.peek().and_then(|c| c.to_digit(16))
-                {
-                    code = code * 16 + d;
-                    digits += 1;
-                    chars.next();
-                }
-                if digits == 0 {
-                    return None;
-                }
+                let code = hex(&mut chars)?;
+                let code = if (0xD800..0xDC00).contains(&code) {
+                    // A UTF-16 high surrogate: Qt writes a character beyond U+FFFF as two escapes.
+                    if chars.next() != Some('\\') || chars.next() != Some('x') {
+                        return None;
+                    }
+                    let low = hex(&mut chars)?;
+                    if !(0xDC00..0xE000).contains(&low) {
+                        return None;
+                    }
+                    0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                } else {
+                    code
+                };
                 out.push(char::from_u32(code)?);
             }
             _ => return None,
@@ -213,15 +215,50 @@ fn decode(value: &str) -> Option<String> {
     Some(out)
 }
 
-/// A server base URL Share may open: `http://` or `https://`, a host, no space or control
-/// character; the trailing `/` dropped. Anything else (`javascript:`, `file:`) is refused, so a
-/// tampered config can't make Share open something that isn't a web server.
+/// Up to four hex digits after `\x`; `None` when there is none.
+fn hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u32> {
+    let mut code = 0u32;
+    let mut digits = 0;
+    while digits < 4
+        && let Some(d) = chars.peek().and_then(|c| c.to_digit(16))
+    {
+        code = code * 16 + d;
+        digits += 1;
+        chars.next();
+    }
+    (digits > 0).then_some(code)
+}
+
+/// A server base URL Share may open: `http://` or `https://`, a host, an optional port and
+/// subpath; the trailing `/` dropped. Refused: any other scheme (`javascript:`, `file:`), no host,
+/// userinfo (`user:pw@`, which would put credentials in the opened URL and browser history), `?`
+/// or `#` (they would swallow the Files path appended to it), `\`, spaces and control characters.
+/// A refused URL drops its account, so Share says "No Nextcloud connected" for its folders.
 fn server_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim_end_matches('/');
     let rest = trimmed.strip_prefix("https://").or_else(|| trimmed.strip_prefix("http://"))?;
-    let host = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#' | '@' | '\\')) {
         return None;
     }
-    Some(trimmed.to_string())
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        // An IPv6 literal: `[…]` then an optional `:port`.
+        Some(v6) => {
+            let (inside, after) = v6.split_once(']')?;
+            if inside.is_empty() || !(after.is_empty() || port(after.strip_prefix(':')?)) {
+                return None;
+            }
+            inside
+        }
+        None => match authority.split_once(':') {
+            Some((host, p)) if port(p) => host,
+            Some(_) => return None,
+            None => authority,
+        },
+    };
+    (!host.is_empty()).then(|| trimmed.to_string())
+}
+
+fn port(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 5 && text.bytes().all(|b| b.is_ascii_digit())
 }

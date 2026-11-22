@@ -136,31 +136,30 @@ pub fn desktop_route(local_path: &Path) -> ShareRoute {
 /// 1. the first readable config of [`config_candidates`];
 /// 2. the synced folder (`Folders` or `FoldersWithPlaceholders`) that holds the file, by whole
 ///    path components (case-insensitively on macOS and Windows), the deepest one when several
-///    do; the file and each folder are compared with symlinks resolved where that works;
+///    do (on equal depth, the first in the config); the file and each folder are compared with
+///    symlinks resolved, and a path that can't be resolved counts only when it has no `..`;
 /// 3. on macOS, else the File Provider domain folder (a folder directly in
-///    `~/Library/CloudStorage`) whose `com.apple.file-provider-domain-id` ends in an account's
-///    `fileProviderDomainIdentifier`.
+///    `~/Library/CloudStorage`) whose `com.apple.file-provider-domain-id` is
+///    `com.nextcloud.desktopclient.FileProviderExt/` plus an account's `fileProviderDomainIdentifier`.
 pub fn desktop_route_in(local_path: &str, env: &dyn DesktopEnv) -> ShareRoute {
     let platform = env.platform();
     let Some(text) = config_candidates(env).iter().find_map(|p| env.read_config(p)) else { return ShareRoute::None };
     let config = parse(&text);
-    let file = env.canonical(local_path).unwrap_or_else(|| local_path.to_string());
-    let Some(file) = components(platform, &file) else { return ShareRoute::None };
+    let Some(file) = resolve(env, platform, local_path) else { return ShareRoute::None };
 
     let mut best: Option<(usize, &Account, &SyncFolder)> = None;
     for account in &config.accounts {
         for folder in &account.folders {
-            let local = env.canonical(&folder.local_path).unwrap_or_else(|| folder.local_path.clone());
-            let Some(local) = components(platform, &local) else { continue };
+            let Some(local) = resolve(env, platform, &folder.local_path) else { continue };
             if starts_with(platform, &file, &local) && best.is_none_or(|(len, ..)| local.len() > len) {
                 best = Some((local.len(), account, folder));
             }
         }
     }
     if let Some((len, account, folder)) = best {
-        let target = folder.target_path.split(['/', '\\']).filter(|n| !n.is_empty());
+        let Some(target) = target_names(platform, &folder.target_path) else { return ShareRoute::None };
         let rest = file.iter().skip(len).map(String::as_str);
-        return route(account, target.chain(rest));
+        return route(account, target.into_iter().chain(rest));
     }
     if platform == Platform::MacOs {
         return file_provider_route(env, &config, &file);
@@ -178,13 +177,38 @@ fn file_provider_route(env: &dyn DesktopEnv, config: &ClientConfig, file: &[Stri
     }
     let domain_dir = format!("/{}", file.iter().skip(1).take(cloud.len()).map(String::as_str).collect::<Vec<_>>().join("/"));
     let Some(value) = env.file_provider_domain(&domain_dir) else { return ShareRoute::None };
-    let uuid = value.rsplit('/').next().unwrap_or_default();
+    let Some(uuid) = value.strip_prefix(FILE_PROVIDER_PREFIX) else { return ShareRoute::None };
     let account =
         config.accounts.iter().find(|a| a.file_provider_domain.as_deref().is_some_and(|d| !uuid.is_empty() && d.eq_ignore_ascii_case(uuid)));
     match account {
         Some(account) => route(account, file.iter().skip(cloud.len() + 1).map(String::as_str)),
         None => ShareRoute::None,
     }
+}
+
+/// The start of the Nextcloud client's File Provider domain id attribute; the rest is the uuid.
+const FILE_PROVIDER_PREFIX: &str = "com.nextcloud.desktopclient.FileProviderExt/";
+
+/// `path` as components, symlinks resolved by the OS. When that fails (a missing file, no access)
+/// the path is taken as written, unless it has a `..`: a lexical `..` after a symlinked folder
+/// means something else on disk, so such a path counts as no Nextcloud.
+fn resolve(env: &dyn DesktopEnv, platform: Platform, path: &str) -> Option<Vec<String>> {
+    match env.canonical(path) {
+        Some(real) => components(platform, &real),
+        None if path.split(['/', '\\']).any(|n| n == "..") => None,
+        None => components(platform, path),
+    }
+}
+
+/// The names of a folder pair's `targetPath`. It is a server path, so `/` separates; a Windows
+/// client may also write `\`. `None` for `.` or `..`, which a real client never writes.
+fn target_names(platform: Platform, target: &str) -> Option<Vec<&str>> {
+    let names: Vec<&str> = if platform == Platform::Windows {
+        target.split(['/', '\\']).filter(|n| !n.is_empty()).collect()
+    } else {
+        target.split('/').filter(|n| !n.is_empty()).collect()
+    };
+    (!names.iter().any(|n| *n == "." || *n == "..")).then_some(names)
 }
 
 fn route<'a>(account: &Account, names: impl Iterator<Item = &'a str>) -> ShareRoute {

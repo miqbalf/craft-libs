@@ -22,7 +22,7 @@ mod url;
 
 pub use desktop::{DesktopEnv, SystemEnv, config_candidates, desktop_route, desktop_route_in};
 pub use path::Platform;
-pub use url::sharing_url;
+pub use url::{FILES_APP_PATH, sharing_url};
 
 use serde::{Deserialize, Serialize};
 
