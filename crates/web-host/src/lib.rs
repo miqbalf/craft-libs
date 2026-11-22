@@ -6,8 +6,8 @@
 //!
 //! | Kind | Direction | Fields |
 //! |---|---|---|
-//! | `ready` | app → host | `version`, `appVersion?`, `file?` (`true`: it reads a `File`/`Blob` in slices) |
-//! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs), `saves?` (`true`: the host stores saves) |
+//! | `ready` | app → host | `version`, `appVersion?`, `file?` (`true`: it reads a `File`/`Blob` in slices), `shareButton?` (`true`: the app has its own Share button) |
+//! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs), `saves?` (`true`: the host stores saves), `share?` (`true`: the host opens Nextcloud sharing on `share`) |
 //! | `open` | host → app | `name`, and `bytes` or `file` + `size` |
 //! | `attach-pdf` | host → app | `name`, `bytes`, `page` (from 1), `insertion` ([x,y,z]), `width`, `height` in drawing units |
 //! | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` |
@@ -18,6 +18,7 @@
 //! | `failed` | app → host | `error`, `id?` |
 //! | `handoff` | app → host | `name`, and `bytes` or `file` + `size` |
 //! | `handoff-done` | host → app | `name`, `app` |
+//! | `share` | app → host | none: open the host's sharing for the open file (only after `host` said `share: true`) |
 //!
 //! A host answers `saved` or `save-failed` only for a `save` that carries an `id`; an app that sends
 //! none treats a save as done once it is posted. When `host` has no `saves`, the app keeps its
@@ -90,6 +91,7 @@ pub enum Outgoing {
     Dirty,
     Failed,
     Handoff,
+    Share,
 }
 
 /// What a host sends to an app.
@@ -112,6 +114,7 @@ impl Outgoing {
             Self::Dirty => "dirty",
             Self::Failed => "failed",
             Self::Handoff => "handoff",
+            Self::Share => "share",
         }
     }
 }
@@ -142,6 +145,31 @@ impl Incoming {
 /// The `type` of a message: `<app>:<kind>`.
 pub fn message_type(app: &str, kind: &str) -> String {
     format!("{app}:{kind}")
+}
+
+/// One field value of an app's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Field {
+    Str(String),
+    Bool(bool),
+}
+
+/// The fields of `<app>:ready`: `version`, `appVersion`, `file`, and `shareButton: true` when the
+/// app has its own Share button (so the host shows none of its own). Without a Share button the
+/// field is left out, so the message stays what the earlier bridges sent.
+pub fn ready_fields(app_version: &str, reads_files: bool, share_button: bool) -> Vec<(&'static str, Field)> {
+    let mut fields =
+        vec![("version", Field::Str(VERSION.to_string())), ("appVersion", Field::Str(app_version.to_string())), ("file", Field::Bool(reads_files))];
+    if share_button {
+        fields.push(("shareButton", Field::Bool(true)));
+    }
+    fields
+}
+
+/// A `host` message's flag (`handoff`, `saves`, `share`): on only for a JSON `true`, so a host that
+/// says `"true"`, `1` or nothing gets the earlier behaviour.
+pub fn host_flag(value: Option<bool>) -> bool {
+    value == Some(true)
 }
 
 /// A file name from a host, made safe to show and save under: path separators and control
@@ -313,6 +341,30 @@ mod tests {
             assert_eq!(Incoming::parse("gridcraft", &message_type("gridcraft", kind.kind())), Some(kind));
         }
         assert_eq!(message_type("cadcraft", Outgoing::Handoff.kind()), "cadcraft:handoff");
+    }
+
+    #[test]
+    fn share_is_an_outgoing_kind_and_never_incoming() {
+        // The wire name WordCraft's sh/host-share bridge already posts.
+        assert_eq!(message_type("wordcraft", Outgoing::Share.kind()), "wordcraft:share");
+        assert_eq!(Incoming::parse("wordcraft", "wordcraft:share"), None, "share goes app to host only");
+    }
+
+    #[test]
+    fn ready_says_share_button_only_when_the_app_has_one() {
+        let names = |share: bool| ready_fields("0.14.0", false, share).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        assert_eq!(names(false), ["version", "appVersion", "file"], "the earlier ready, unchanged");
+        let with = ready_fields("0.14.0", false, true);
+        assert!(with.contains(&("shareButton", Field::Bool(true))));
+        assert!(with.contains(&("version", Field::Str(VERSION.to_string()))));
+        assert_eq!(with.len(), names(false).len() + 1);
+    }
+
+    #[test]
+    fn a_host_flag_is_on_only_for_true() {
+        assert!(host_flag(Some(true)));
+        assert!(!host_flag(Some(false)));
+        assert!(!host_flag(None));
     }
 
     #[test]

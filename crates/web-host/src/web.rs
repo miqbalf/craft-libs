@@ -15,7 +15,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::js_sys;
 
 use crate::live::{LIVE_TYPE, LiveError, LiveMessage, LiveState, READY_JSON};
-use crate::{FontRef, Inbox, Incoming, Mode, Outgoing, VERSION, file_name, message_type};
+use crate::{Field, FontRef, Inbox, Incoming, Mode, Outgoing, VERSION, file_name, host_flag, message_type, ready_fields};
 
 /// A file the host passes in, not yet copied into the app's memory: check its size first.
 pub enum FileData {
@@ -38,8 +38,9 @@ impl FileData {
 /// A message from the host.
 pub enum Message {
     /// What the host supports; `handoff`: it routes files the app hands off; `saves`: it stores
-    /// saves, so the app sends `save` with an id and trusts only `saved`.
-    Host { version: String, handoff: bool, saves: bool },
+    /// saves, so the app sends `save` with an id and trusts only `saved`; `share`: it opens
+    /// Nextcloud sharing for the open file when the app posts `share` ([`Host::post_share`]).
+    Host { version: String, handoff: bool, saves: bool, share: bool },
     /// Open a document as File › Open would. `name` is already cleaned ([`crate::file_name`]).
     Open { name: String, data: FileData },
     /// Attach one PDF page to the current drawing without opening another document.
@@ -145,7 +146,35 @@ impl Host {
     /// The app is listening: send a document now. `app_version` is the app's own release;
     /// `reads_files`: it takes a `File`/`Blob` and reads it in slices.
     pub fn post_ready(&self, app_version: &str, reads_files: bool) -> Result<(), String> {
-        self.post(Outgoing::Ready, &[("version", VERSION.into()), ("appVersion", app_version.into()), ("file", reads_files.into())], None)
+        self.post_ready_with(app_version, reads_files, false)
+    }
+
+    /// [`Self::post_ready`], saying also whether the app has its own Share button
+    /// (`shareButton: true`), so the host shows none of its own. An app with a Share button calls
+    /// this instead of `post_ready` and hand-builds no `ready` of its own.
+    pub fn post_ready_with(&self, app_version: &str, reads_files: bool, share_button: bool) -> Result<(), String> {
+        let fields: Vec<(&str, JsValue)> = ready_fields(app_version, reads_files, share_button)
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key,
+                    match value {
+                        Field::Str(text) => JsValue::from(text),
+                        Field::Bool(flag) => JsValue::from(flag),
+                    },
+                )
+            })
+            .collect();
+        self.post(Outgoing::Ready, &fields, None)
+    }
+
+    /// Share was pressed and the host said `share: true`: post `<app>:share {}` so the host opens
+    /// Nextcloud's sharing for the open file. Under `?host=parent` it goes only to the same-origin
+    /// parent; with `data-host="page"` it is a `CustomEvent` on the canvas. The app decides when
+    /// to call it (`craft_share::ShareRoute::web(share)`); without `share: true` it shows "No
+    /// Nextcloud connected" instead.
+    pub fn post_share(&self) -> Result<(), String> {
+        self.post(Outgoing::Share, &[], None)
     }
 
     /// Hear the host's unprefixed `live` messages (`craft-live/1`), only from the framing parent
@@ -253,8 +282,9 @@ fn read(kind: Incoming, data: &JsValue) -> Option<Message> {
     Some(match kind {
         Incoming::Host => Message::Host {
             version: string(data, "version").unwrap_or_else(|| VERSION.to_string()),
-            handoff: get(data, "handoff").as_bool() == Some(true),
-            saves: get(data, "saves").as_bool() == Some(true),
+            handoff: host_flag(get(data, "handoff").as_bool()),
+            saves: host_flag(get(data, "saves").as_bool()),
+            share: host_flag(get(data, "share").as_bool()),
         },
         Incoming::Open => {
             let name = file_name(string(data, "name").as_deref(), "document");
@@ -333,6 +363,34 @@ pub async fn fetch_font(font: &FontRef) -> Result<Vec<u8>, String> {
         return Err(format!("{} is empty or too large", font.name));
     }
     Ok(bytes.to_vec())
+}
+
+/// Download `bytes` as a file named `name` (cleaned with [`file_name`]) of type `mime` (empty:
+/// `application/octet-stream`): a `Blob`, an object URL and a hidden `<a download>` clicked once.
+/// The URL is revoked ten seconds later; the download keeps its own reference. Works framed or
+/// not, with no host message.
+pub fn download(name: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
+    let js = |e: JsValue| e.as_string().unwrap_or_else(|| format!("{e:?}"));
+    let window = web_sys::window().ok_or("no window")?;
+    let document = window.document().ok_or("no document")?;
+    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(if mime.is_empty() { "application/octet-stream" } else { mime });
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options).map_err(js)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
+    let anchor: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
+    anchor.set_href(&url);
+    anchor.set_download(&file_name(Some(name), "download"));
+    anchor.style().set_property("display", "none").map_err(js)?;
+    let body = document.body().ok_or("no body")?;
+    body.append_child(&anchor).map_err(js)?;
+    anchor.click();
+    anchor.remove();
+    let revoke = Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
+    window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
+    Ok(())
 }
 
 /// `file` (a `Blob`; its `size` field is ignored for the Blob's own) or `bytes` (an `ArrayBuffer` or `Uint8Array`), not copied.
@@ -534,13 +592,21 @@ mod tests {
     fn a_host_message_and_a_handoff_done_read_whatever_fields_exist() {
         // Nothing required: a missing version is the contract's, `handoff` is true only for `true`.
         for data in [JsValue::NULL, obj(&[]), obj(&[("handoff", "yes".into())]), obj(&[("handoff", 1.into())])] {
-            let Some(Message::Host { version, handoff, saves }) = read(Incoming::Host, &data) else { panic!("a host message is read") };
+            let Some(Message::Host { version, handoff, saves, share }) = read(Incoming::Host, &data) else { panic!("a host message is read") };
             assert_eq!(version, crate::VERSION);
             assert!(!handoff);
             assert!(!saves);
+            assert!(!share);
         }
         assert!(matches!(read(Incoming::Host, &obj(&[("handoff", true.into())])), Some(Message::Host { handoff: true, .. })));
         assert!(matches!(read(Incoming::Host, &obj(&[("saves", true.into())])), Some(Message::Host { saves: true, .. })));
+        assert!(matches!(read(Incoming::Host, &obj(&[("share", true.into())])), Some(Message::Host { share: true, saves: false, .. })));
+        for not_true in [JsValue::from("true"), 1.into(), false.into(), JsValue::NULL] {
+            assert!(
+                matches!(read(Incoming::Host, &obj(&[("share", not_true)])), Some(Message::Host { share: false, .. })),
+                "share is true only for true"
+            );
+        }
         for not_true in [JsValue::from("true"), 1.into(), false.into(), JsValue::NULL] {
             assert!(
                 matches!(read(Incoming::Host, &obj(&[("saves", not_true)])), Some(Message::Host { saves: false, .. })),
