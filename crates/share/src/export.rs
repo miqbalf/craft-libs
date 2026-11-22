@@ -17,9 +17,14 @@
 
 use std::fmt;
 
-/// The most characters of a file name [`ExportList::file_name`] gives (the extension is kept). The
-/// same cap as `craft_web_host::MAX_NAME_CHARS`, so a download keeps the name unchanged.
+/// Kept for code written against the first version. Names are capped by [`MAX_FILE_NAME_BYTES`],
+/// which is stricter (a name of at most 255 bytes also has at most 255 characters, so
+/// `craft_web_host::MAX_NAME_CHARS` never cuts it).
 pub const MAX_FILE_NAME_CHARS: usize = 255;
+
+/// The most UTF-8 bytes of a file name this module gives (the extension is kept): the limit of
+/// ext4, APFS and most other file systems.
+pub const MAX_FILE_NAME_BYTES: usize = 255;
 
 /// What a name with nothing left after cleaning, and an empty fallback, is called.
 const UNTITLED: &str = "Untitled";
@@ -42,17 +47,32 @@ pub struct ExportFormat {
     /// The format writes several files (one per slide, page or image). The name is the base the
     /// app numbers from with its own rule; on the web each file is its own download.
     pub many: bool,
+    /// Other extensions the format writes (lower case, no dot), e.g. `jpg` and `tif` for an image
+    /// format whose `ext` is `png`. A name or picked path ending in one of them keeps it.
+    pub also_exts: &'static [&'static str],
 }
 
 impl ExportFormat {
     /// A one-file format with no detail line.
     pub const fn new(id: &'static str, label: &'static str, ext: &'static str, mime: &'static str) -> Self {
-        Self { id, label, detail: "", ext, mime, many: false }
+        Self { id, label, detail: "", ext, mime, many: false, also_exts: &[] }
     }
 
     /// The same format with a detail line.
     pub const fn detail(self, detail: &'static str) -> Self {
         Self { detail, ..self }
+    }
+
+    /// The same format, also writing these extensions (lower case, no dot).
+    pub const fn also_exts(self, also_exts: &'static [&'static str]) -> Self {
+        Self { also_exts, ..self }
+    }
+
+    /// Whether the format writes files with extension `ext` (any case, a leading dot ignored):
+    /// its `ext` or one of its `also_exts`.
+    pub fn accepts(&self, ext: &str) -> bool {
+        let ext = ext.strip_prefix('.').unwrap_or(ext);
+        !ext.is_empty() && (self.ext.eq_ignore_ascii_case(ext) || self.also_exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
     }
 
     /// The same format, writing several files.
@@ -183,18 +203,19 @@ impl ExportList {
         if ext.is_empty() {
             return None;
         }
-        self.formats.iter().find(|f| f.ext.eq_ignore_ascii_case(ext)).copied()
+        self.formats.iter().find(|f| f.ext.eq_ignore_ascii_case(ext)).or_else(|| self.formats.iter().find(|f| f.accepts(ext))).copied()
     }
 
     /// Whether `ext` is one the list writes or one of its [`Self::replacing`] extensions: such an
     /// extension on a name gives way to the chosen format's; any other (`notes.v2`) is part of
     /// the name.
     pub fn is_document_ext(&self, ext: &str) -> bool {
-        !ext.is_empty() && (self.formats.iter().any(|f| f.ext.eq_ignore_ascii_case(ext)) || self.extra.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+        !ext.is_empty() && (self.formats.iter().any(|f| f.accepts(ext)) || self.extra.iter().any(|e| e.eq_ignore_ascii_case(ext)))
     }
 
     /// Whether the list follows the rules: not empty; ids unique and not empty; labels not
-    /// empty; extensions lower case ASCII letters and digits; MIME types `type/subtype`. Each
+    /// empty and unique (a label is also the save dialog's filter name); extensions (`ext`,
+    /// `also_exts`, `replacing`) lower case ASCII letters and digits; MIME types `type/subtype`. Each
     /// app's tests call it on its list.
     pub fn check(&self) -> Result<(), ExportError> {
         let bad = |why: String| Err(ExportError::BadList(why));
@@ -212,6 +233,12 @@ impl ExportList {
             if f.label.trim().is_empty() {
                 return bad(format!("“{}” has no label", f.id));
             }
+            if self.formats[..i].iter().any(|g| g.label == f.label) {
+                return bad(format!("label “{}” is used twice", f.label));
+            }
+            if let Some(e) = f.also_exts.iter().find(|e| !ext_ok(e)) {
+                return bad(format!("“{}” also has extension “{e}”: use lower case letters and digits, no dot", f.id));
+            }
             if !ext_ok(f.ext) {
                 return bad(format!("“{}” has extension “{}”: use lower case letters and digits, no dot", f.id, f.ext));
             }
@@ -226,35 +253,70 @@ impl ExportList {
         Ok(())
     }
 
-    /// The naming rule: the name a copy of the document `doc_name` (a name or a path) in format
-    /// `id` gets.
+    /// The naming rule for a document **path or file name** `doc_name`: the name a copy in format
+    /// `id` gets. Use [`Self::file_name_from_title`] for a title, which may contain `/`.
     ///
-    /// - Folders (`/` or `\`) and control characters are dropped and space is trimmed; with
-    ///   nothing left (or `.`/`..`) `fallback` is used, cleaned the same way (then `Untitled`).
+    /// - Only the last component counts (folders before `/` or `\` are dropped).
+    /// - Control characters and invisible format characters (bidi overrides, zero-width space,
+    ///   BOM, soft hyphen) are dropped; the characters Windows refuses, `< > : " | ? *`, become
+    ///   `_`. Space is trimmed, leading dots are dropped (no hidden files), and trailing dots and
+    ///   spaces are dropped (Windows drops them too).
+    /// - With nothing left, or only a document extension left (`.pdf`, `...`), `fallback` is
+    ///   used, cleaned the same way (then `Untitled`).
     /// - The format's extension replaces a document extension ([`Self::is_document_ext`]):
-    ///   `notes.docx` as PDF is `notes.pdf`. It is kept when it already matches in any case
-    ///   (`notes.PDF`). Any other name gets it added (`notes.v2.pdf`); a trailing `.` is dropped
-    ///   first, and a dotfile name (`.docx`) is a stem (`.docx.pdf`).
-    /// - At most [`MAX_FILE_NAME_CHARS`] characters, cut from the stem so the extension stays.
+    ///   `notes.docx` as PDF is `notes.pdf`, and the stem loses trailing dots and spaces
+    ///   (`notes .docx` is `notes.pdf`). An extension the format accepts is kept as typed
+    ///   (`notes.PDF`; `scan.jpeg` for an image format with `also_exts` `jpeg`). Any other name gets
+    ///   the extension added (`notes.v2.pdf`, `report.pdf.` is `report.pdf`).
+    /// - A stem that is a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+    ///   `LPT1`-`LPT9`, any case, before its first dot) gets a `_` prefix: `_CON.pdf`.
+    /// - At most [`MAX_FILE_NAME_BYTES`] UTF-8 bytes, cut from the stem on a character boundary
+    ///   (not between a letter and its combining marks or joiners), so the extension stays.
     pub fn file_name(&self, doc_name: &str, fallback: &str, id: &str) -> Result<String, ExportError> {
-        let format = self.get(id).ok_or_else(|| ExportError::UnknownFormat(id.to_string()))?;
-        let base = clean(doc_name).or_else(|| clean(fallback)).unwrap_or_else(|| UNTITLED.to_string());
-        let named = self.with_ext(&base, format.ext);
-        Ok(cap(&named, format.ext))
+        self.named(doc_name, fallback, id, Source::Path, None)
     }
 
-    /// A path picked in the desktop save dialog for format `id`, with the extension rule of
-    /// [`Self::file_name`] applied to its file name (the folders are kept as given). When this
-    /// changes the path, [`Picked::renamed`] says so: the dialog's overwrite question was about
-    /// the other name.
+    /// [`Self::file_name`] for a document **title** (not a path): `/` and `\` are ordinary
+    /// characters and become `-` (`Budget 2025/26` is `Budget 2025-26.pdf`); every other rule is
+    /// the same. The fallback is read as a title too.
+    pub fn file_name_from_title(&self, title: &str, fallback: &str, id: &str) -> Result<String, ExportError> {
+        self.named(title, fallback, id, Source::Title, None)
+    }
+
+    /// The name of file number `n` of a many-file format ([`ExportFormat::many`]):
+    /// [`Self::file_name`] with `-{n}` before the extension (`Deck-3.png`), capped the same way
+    /// with the number and extension kept.
+    pub fn numbered_file_name(&self, doc_name: &str, fallback: &str, id: &str, n: usize) -> Result<String, ExportError> {
+        self.named(doc_name, fallback, id, Source::Path, Some(n))
+    }
+
+    /// A path picked in the desktop save dialog for format `id`. The folders are kept as given;
+    /// only the file name may change:
+    ///
+    /// - trailing dots and spaces are dropped (`report.pdf.` is `report.pdf`);
+    /// - an extension the format accepts ([`ExportFormat::accepts`]) is kept as typed;
+    /// - any other name keeps everything the user typed and gets the format's extension added:
+    ///   `notes` is `notes.pdf`, and `data.csv` picked for PDF is `data.csv.pdf`, even when `csv`
+    ///   is another format of the list (the chosen format, not the typed extension, decides what
+    ///   is written, and the user's name is never replaced);
+    /// - at most [`MAX_FILE_NAME_BYTES`] bytes, cut from the stem.
+    ///
+    /// No other cleaning: the dialog already accepted the name. When the path changes,
+    /// [`Picked::renamed`] says so: the dialog's overwrite question was about the other name, so
+    /// the app must not overwrite an existing file at the new path without asking.
     pub fn picked_path(&self, picked: &str, id: &str) -> Result<Picked, ExportError> {
-        let format = self.get(id).ok_or_else(|| ExportError::UnknownFormat(id.to_string()))?;
+        let format = self.format(id)?;
         let cut = picked.rfind(['/', '\\']).map_or(0, |i| i + 1);
         let (dir, file) = picked.split_at(cut);
-        if file.is_empty() || file == "." || file == ".." {
+        let file = file.trim_end_matches(['.', ' ']);
+        if file.is_empty() {
             return Err(ExportError::NoFileName);
         }
-        let path = format!("{dir}{}", self.with_ext(file, format.ext));
+        let (stem, ext) = match file.rfind('.') {
+            Some(i) if format.accepts(&file[i + 1..]) => (&file[..i], &file[i + 1..]),
+            _ => (file, format.ext),
+        };
+        let path = format!("{dir}{}", cap(stem, &format!(".{ext}")));
         let renamed = path != picked;
         Ok(Picked { path, renamed })
     }
@@ -262,46 +324,113 @@ impl ExportList {
     /// [`Self::file_name`] and [`Runtime::save_as_delivery`] together.
     pub fn plan(&self, runtime: Runtime, doc_name: &str, fallback: &str, id: &str) -> Result<SaveAsPlan, ExportError> {
         let file_name = self.file_name(doc_name, fallback, id)?;
-        let format = self.get(id).ok_or_else(|| ExportError::UnknownFormat(id.to_string()))?;
+        let format = self.format(id)?;
         Ok(SaveAsPlan { format, file_name, delivery: runtime.save_as_delivery() })
     }
 
-    /// `name` with extension `want` (the rule in [`Self::file_name`]).
-    fn with_ext(&self, name: &str, want: &str) -> String {
-        // A dot at 0 starts a dotfile name, not an extension.
-        match name.rfind('.').filter(|&i| i > 0) {
-            Some(i) => {
-                let (stem, ext) = (&name[..i], &name[i + 1..]);
-                if ext.eq_ignore_ascii_case(want) {
-                    name.to_string()
-                } else if self.is_document_ext(ext) {
-                    format!("{stem}.{want}")
-                } else {
-                    format!("{}.{want}", name.trim_end_matches('.'))
-                }
-            }
-            None => format!("{name}.{want}"),
+    fn format(&self, id: &str) -> Result<ExportFormat, ExportError> {
+        self.get(id).ok_or_else(|| ExportError::UnknownFormat(id.to_string()))
+    }
+
+    /// The naming rule of [`Self::file_name`], for a path or a title, numbered or not.
+    fn named(&self, raw: &str, fallback: &str, id: &str, source: Source, n: Option<usize>) -> Result<String, ExportError> {
+        let format = self.format(id)?;
+        let base = self.base(raw, source).or_else(|| self.base(fallback, source)).unwrap_or_else(|| UNTITLED.to_string());
+        let (stem, ext) = match base.rfind('.').filter(|&i| i > 0) {
+            Some(i) if format.accepts(&base[i + 1..]) => (base[..i].to_string(), base[i + 1..].to_string()),
+            Some(i) if self.is_document_ext(&base[i + 1..]) => (base[..i].trim_end_matches(['.', ' ']).to_string(), format.ext.to_string()),
+            _ => (base.clone(), format.ext.to_string()),
+        };
+        let stem = if stem.is_empty() { UNTITLED.to_string() } else { stem };
+        let stem = if is_device_name(&stem) { format!("_{stem}") } else { stem };
+        let suffix = match n {
+            Some(n) => format!("-{n}.{ext}"),
+            None => format!(".{ext}"),
+        };
+        Ok(cap(&stem, &suffix))
+    }
+
+    /// `raw` cleaned ([`Self::file_name`]); `None` when nothing is left, or only a document
+    /// extension after a dot (`.pdf`).
+    fn base(&self, raw: &str, source: Source) -> Option<String> {
+        let raw = match source {
+            Source::Path => raw.rsplit(['/', '\\']).next().unwrap_or_default(),
+            Source::Title => raw,
+        };
+        let kept: String = raw
+            .chars()
+            .filter(|&c| !c.is_control() && !is_invisible(c))
+            .map(|c| match c {
+                '/' | '\\' => '-',
+                '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+                c => c,
+            })
+            .collect();
+        let trimmed = kept.trim();
+        let undotted = trimmed.trim_start_matches('.').trim_start();
+        let name = undotted.trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+        let only_ext = undotted.len() < trimmed.len() && !name.contains('.') && self.is_document_ext(name);
+        (!name.is_empty() && !only_ext).then(|| name.to_string())
+    }
+}
+
+/// Where a name comes from: a path (its last component counts) or a title (all of it).
+#[derive(Debug, Clone, Copy)]
+enum Source {
+    Path,
+    Title,
+}
+
+/// Whether `stem` (before its first dot, trailing space ignored) is a Windows device name.
+fn is_device_name(stem: &str) -> bool {
+    let head = stem.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    match head.as_bytes() {
+        [a, b, c] => matches!([*a, *b, *c], [b'C', b'O', b'N'] | [b'P', b'R', b'N'] | [b'A', b'U', b'X'] | [b'N', b'U', b'L']),
+        [a, b, c, d] => matches!([*a, *b, *c], [b'C', b'O', b'M'] | [b'L', b'P', b'T']) && (b'1'..=b'9').contains(d),
+        _ => false,
+    }
+}
+
+/// Invisible format characters that can hide or reorder text in a name: bidi controls, zero-width
+/// space, word joiners, BOM, soft hyphen. Zero-width (non-)joiners stay; scripts need them.
+fn is_invisible(c: char) -> bool {
+    matches!(c as u32, 0xAD | 0x61C | 0x180E | 0x200B | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF)
+}
+
+/// Whether `c` belongs to the character before it: a combining mark, variation selector, joiner
+/// or emoji modifier.
+fn joins(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x300..=0x36F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200C | 0x200D | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0100..=0xE01EF
+    )
+}
+
+/// `stem` + `suffix` (`.ext` or `-n.ext`) in at most [`MAX_FILE_NAME_BYTES`] bytes, cut from the
+/// stem on a character boundary, never between a character and what [`joins`] it, with trailing
+/// dots and spaces of a cut stem dropped.
+fn cap(stem: &str, suffix: &str) -> String {
+    let budget = MAX_FILE_NAME_BYTES.saturating_sub(suffix.len());
+    if stem.len() <= budget {
+        return format!("{stem}{suffix}");
+    }
+    let mut end = budget;
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut kept: Vec<char> = stem[..end].chars().collect();
+    let mut next = stem[end..].chars().next();
+    // Drop the last kept character while what follows it belongs to it, or it is a joiner.
+    while let Some(&last) = kept.last() {
+        if next.is_some_and(joins) || joins(last) {
+            next = kept.pop();
+        } else {
+            break;
         }
     }
-}
-
-/// The last component of `raw`, without control characters and surrounding space; `None` when
-/// nothing (or only `.`/`..`) is left.
-fn clean(raw: &str) -> Option<String> {
-    let base = raw.rsplit(['/', '\\']).next().unwrap_or_default();
-    let kept: String = base.chars().filter(|c| !c.is_control()).collect();
-    let trimmed = kept.trim();
-    (!trimmed.is_empty() && trimmed != "." && trimmed != "..").then(|| trimmed.to_string())
-}
-
-/// `name` (ending in `.{ext}`) cut to [`MAX_FILE_NAME_CHARS`] characters, from the stem.
-fn cap(name: &str, ext: &str) -> String {
-    if name.chars().count() <= MAX_FILE_NAME_CHARS {
-        return name.to_string();
-    }
-    let tail = ext.chars().count() + 1;
-    let stem: String = name.chars().take(MAX_FILE_NAME_CHARS.saturating_sub(tail)).collect();
-    format!("{}.{ext}", stem.trim_end())
+    let cut: String = kept.into_iter().collect();
+    let cut = cut.trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+    format!("{}{suffix}", if cut.is_empty() { "_" } else { cut })
 }
 
 /// The MIME type for a file extension (any case, a leading dot ignored), covering what the Craft

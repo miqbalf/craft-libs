@@ -1,6 +1,6 @@
 //! Save As = Export: the format list, the naming rule and the delivery per platform.
 
-use crate::export::{Delivery, ExportError, ExportFormat, ExportList, MAX_FILE_NAME_CHARS, Picked, Runtime, SaveAsPlan, mime_for_ext};
+use crate::export::{Delivery, ExportError, ExportFormat, ExportList, MAX_FILE_NAME_BYTES, Picked, Runtime, SaveAsPlan, mime_for_ext};
 
 /// A WordCraft-like list: one id (`wordml2003`) whose extension is shared with another format.
 const WORD: ExportList = ExportList::new(&[
@@ -24,6 +24,27 @@ const DECK: ExportList = ExportList::new(&[
     ExportFormat::new("png", "PNG Picture (*.png)", "png", "image/png"),
     ExportFormat::new("pngAll", "PNG Pictures, all slides (*.png)", "png", "image/png").many(),
 ]);
+
+/// A PdfCraft-like list: one image format accepting several extensions.
+const PDF: ExportList = ExportList::new(&[
+    ExportFormat::new("pdf", "PDF (*.pdf)", "pdf", "application/pdf"),
+    ExportFormat::new("image", "Image (*.png, *.jpg, *.tif)", "png", "image/png").also_exts(&["jpg", "jpeg", "tif", "tiff"]).many(),
+    ExportFormat::new("text", "Text (*.txt)", "txt", "text/plain"),
+]);
+
+fn title(list: &ExportList, t: &str, id: &str) -> String {
+    match list.file_name_from_title(t, "Document", id) {
+        Ok(n) => n,
+        Err(e) => format!("ERR {e}"),
+    }
+}
+
+fn picked(list: &ExportList, p: &str, id: &str) -> (String, bool) {
+    match list.picked_path(p, id) {
+        Ok(Picked { path, renamed }) => (path, renamed),
+        Err(e) => (format!("ERR {e}"), false),
+    }
+}
 
 fn name(list: &ExportList, doc: &str, id: &str) -> String {
     match list.file_name(doc, "Document", id) {
@@ -116,7 +137,7 @@ fn name_adds_the_extension_to_other_names() {
     assert_eq!(name(&WORD, "report.odt", "pdf"), "report.odt.pdf", "odt is not in this list");
     assert_eq!(name(&WORD, "a.", "pdf"), "a.pdf", "a trailing dot is dropped");
     assert_eq!(name(&WORD, "a..", "pdf"), "a.pdf");
-    assert_eq!(name(&WORD, ".docx", "pdf"), ".docx.pdf", "a dotfile name is a stem");
+    assert_eq!(name(&WORD, ".notes", "pdf"), "notes.pdf", "no hidden files: leading dots go");
 }
 
 #[test]
@@ -141,12 +162,22 @@ fn name_falls_back_when_nothing_is_left() {
 fn name_is_capped_and_keeps_its_extension() {
     let long = "x".repeat(400);
     let n = name(&WORD, &format!("{long}.docx"), "pdf");
-    assert_eq!(n.chars().count(), MAX_FILE_NAME_CHARS);
-    assert!(n.ends_with(".pdf"));
+    assert_eq!(n.len(), MAX_FILE_NAME_BYTES);
+    assert!(n.ends_with("x.pdf"));
+    let n = name(&WORD, &format!("{long}.pdf"), "pdf");
+    assert_eq!(n.len(), MAX_FILE_NAME_BYTES, "a name already ending in the extension is capped too");
+    assert!(n.ends_with("x.pdf"));
+    // Bytes, not characters: 255 bytes is the limit on ext4, APFS and NTFS-as-UTF-8 alike.
     let wide = "é".repeat(300);
     let n = name(&WORD, &wide, "txt");
-    assert_eq!(n.chars().count(), MAX_FILE_NAME_CHARS);
+    assert!(n.len() <= MAX_FILE_NAME_BYTES && n.len() >= MAX_FILE_NAME_BYTES - 1, "{}", n.len());
     assert!(n.ends_with("é.txt"));
+    let cjk = "漢".repeat(200);
+    let n = name(&WORD, &cjk, "pdf");
+    assert!(n.len() <= MAX_FILE_NAME_BYTES && n.ends_with("漢.pdf"));
+    // A cut that lands before a space leaves no trailing space before the extension.
+    let n = name(&WORD, &format!("{} tail", "x".repeat(250)), "pdf");
+    assert!(n.len() <= MAX_FILE_NAME_BYTES && n.ends_with("x.pdf"), "{n}");
 }
 
 #[test]
@@ -165,7 +196,11 @@ fn picked_path_with_the_right_extension_is_kept() {
 #[test]
 fn picked_path_gets_the_extension_and_says_it_was_renamed() {
     assert_eq!(WORD.picked_path("/home/me/notes", "pdf"), Ok(Picked { path: "/home/me/notes.pdf".into(), renamed: true }));
-    assert_eq!(WORD.picked_path("/home/me/notes.docx", "wordml2003"), Ok(Picked { path: "/home/me/notes.xml".into(), renamed: true }));
+    assert_eq!(
+        WORD.picked_path("/home/me/notes.docx", "wordml2003"),
+        Ok(Picked { path: "/home/me/notes.docx.xml".into(), renamed: true }),
+        "a typed extension of another format is the user's name: the chosen one is added"
+    );
     assert_eq!(WORD.picked_path(r"C:\me\notes.v2", "txt"), Ok(Picked { path: r"C:\me\notes.v2.txt".into(), renamed: true }));
     assert_eq!(WORD.picked_path("notes", "pdf"), Ok(Picked { path: "notes.pdf".into(), renamed: true }), "no folder");
     assert_eq!(WORD.picked_path("/home/me.d/notes", "pdf"), Ok(Picked { path: "/home/me.d/notes.pdf".into(), renamed: true }), "a dot in a folder");
@@ -254,4 +289,130 @@ fn formats_are_const_and_copy() {
     let g = F;
     assert_eq!(F, g);
     assert!(g.many);
+}
+
+// ---- fix round 1 ----
+
+#[test]
+fn title_keeps_slashes_as_text() {
+    assert_eq!(title(&WORD, "Budget 2025/26", "pdf"), "Budget 2025-26.pdf");
+    assert_eq!(title(&WORD, "Q1/Q2 plan.docx", "pdf"), "Q1-Q2 plan.pdf");
+    assert_eq!(title(&WORD, r"AC\DC notes", "txt"), "AC-DC notes.txt");
+    assert_eq!(title(&WORD, "", "pdf"), "Document.pdf");
+    assert_eq!(title(&WORD, "/", "pdf"), "-.pdf");
+    assert_eq!(WORD.file_name_from_title("x", "Document", "gif"), Err(ExportError::UnknownFormat("gif".into())));
+}
+
+#[test]
+fn names_are_safe_on_windows() {
+    assert_eq!(title(&WORD, "Q3: Report?", "pdf"), "Q3_ Report_.pdf");
+    assert_eq!(title(&WORD, r#"a<b>c"d|e*f"#, "pdf"), "a_b_c_d_e_f.pdf");
+    assert_eq!(name(&WORD, "C:/x/what?.docx", "pdf"), "what_.pdf");
+    for (doc, want) in [
+        ("CON", "_CON.pdf"),
+        ("nul.docx", "_nul.pdf"),
+        ("com1", "_com1.pdf"),
+        ("LPT9.txt", "_LPT9.pdf"),
+        ("aux.tar", "_aux.tar.pdf"),
+        ("Prn ", "_Prn.pdf"),
+    ] {
+        assert_eq!(name(&WORD, doc, "pdf"), want, "{doc:?}");
+    }
+    for doc in ["CONSOLE", "com10", "lpt", "con-x"] {
+        assert!(!name(&WORD, doc, "pdf").starts_with('_'), "{doc:?}");
+    }
+    assert_eq!(name(&WORD, "report . ", "pdf"), "report.pdf", "trailing dots and spaces go");
+}
+
+#[test]
+fn spoofing_and_invisible_characters_are_dropped() {
+    assert_eq!(name(&WORD, "invoice\u{202E}fdp.docx", "pdf"), "invoicefdp.pdf");
+    assert_eq!(name(&WORD, "a\u{200B}b\u{FEFF}\u{2066}c", "pdf"), "abc.pdf");
+}
+
+#[test]
+fn no_hidden_or_doubled_names() {
+    for doc in [".pdf", "...", ".docx", "..docx", " . "] {
+        assert_eq!(name(&WORD, doc, "pdf"), "Document.pdf", "{doc:?}");
+    }
+    assert_eq!(name(&WORD, "report.pdf.", "pdf"), "report.pdf");
+    assert_eq!(name(&WORD, "notes.docx.", "pdf"), "notes.pdf");
+    assert_eq!(name(&WORD, "notes .docx", "pdf"), "notes.pdf");
+    assert_eq!(name(&WORD, "a..docx", "pdf"), "a.pdf");
+}
+
+#[test]
+fn numbered_names_put_the_number_before_the_extension() {
+    assert_eq!(DECK.numbered_file_name("/d/Deck.pptx", "Presentation", "pngAll", 3), Ok("Deck-3.png".to_string()));
+    assert_eq!(DECK.numbered_file_name("", "Presentation", "pngAll", 12), Ok("Presentation-12.png".to_string()));
+    assert_eq!(DECK.numbered_file_name("con", "P", "png", 1), Ok("_con-1.png".to_string()));
+    let long = "x".repeat(300);
+    let Ok(n) = DECK.numbered_file_name(&long, "P", "pngAll", 1234) else { panic!("numbered") };
+    assert!(n.len() <= MAX_FILE_NAME_BYTES && n.ends_with("x-1234.png"), "{n}");
+    assert_eq!(DECK.numbered_file_name("a", "P", "gif", 1), Err(ExportError::UnknownFormat("gif".into())));
+}
+
+#[test]
+fn a_format_can_accept_several_extensions() {
+    let Some(image) = PDF.get("image") else { panic!("image") };
+    assert!(image.accepts("JPG") && image.accepts(".tiff") && image.accepts("png"));
+    assert!(!image.accepts("pdf") && !image.accepts(""));
+    assert!(PDF.is_document_ext("jpeg"), "also_exts count as document extensions");
+    assert_eq!(PDF.for_ext("tif").map(|f| f.id), Some("image"));
+    assert_eq!(PDF.file_name("scan.jpeg", "D", "image"), Ok("scan.jpeg".to_string()), "an accepted extension is kept");
+    assert_eq!(PDF.file_name("scan.pdf", "D", "image"), Ok("scan.png".to_string()));
+    assert_eq!(picked(&PDF, "/p/scan.jpg", "image"), ("/p/scan.jpg".to_string(), false));
+    assert_eq!(picked(&PDF, "/p/scan.TIF", "image"), ("/p/scan.TIF".to_string(), false));
+    assert_eq!(picked(&PDF, "/p/scan", "image"), ("/p/scan.png".to_string(), true));
+    assert_eq!(PDF.check(), Ok(()));
+    let bad = ExportList::new(const { &[ExportFormat::new("a", "A", "png", "image/png").also_exts(&[".jpg"])] });
+    assert!(matches!(bad.check(), Err(ExportError::BadList(_))), "also_exts follow the ext rule");
+}
+
+#[test]
+fn check_refuses_two_formats_with_one_label() {
+    let list =
+        ExportList::new(const { &[ExportFormat::new("a", "Same", "pdf", "application/pdf"), ExportFormat::new("b", "Same", "txt", "text/plain")] });
+    assert!(matches!(list.check(), Err(ExportError::BadList(_))));
+}
+
+#[test]
+fn picked_path_edge_cases() {
+    assert_eq!(picked(&WORD, "/home/me/a.", "pdf"), ("/home/me/a.pdf".to_string(), true));
+    assert_eq!(picked(&WORD, "/home/me/report.pdf.", "pdf"), ("/home/me/report.pdf".to_string(), true));
+    assert_eq!(picked(&WORD, "/home/me/über café", "pdf"), ("/home/me/über café.pdf".to_string(), true));
+    assert_eq!(picked(&WORD, r"C:\me/mixed\notes", "txt"), (r"C:\me/mixed\notes.txt".to_string(), true));
+    assert_eq!(picked(&WORD, "/home/me/.notes", "pdf"), ("/home/me/.notes.pdf".to_string(), true), "a typed dotfile stays the user's");
+    assert_eq!(picked(&WORD, "/home/me/data.csv", "pdf"), ("/home/me/data.csv.pdf".to_string(), true), "not a list ext: added");
+    assert_eq!(
+        picked(&WORD, "/home/me/data.txt", "pdf"),
+        ("/home/me/data.txt.pdf".to_string(), true),
+        "another list format's ext: kept, chosen one added"
+    );
+    for p in ["/home/me/.", "/home/me/..", "."] {
+        assert_eq!(WORD.picked_path(p, "pdf"), Err(ExportError::NoFileName), "{p}");
+    }
+}
+
+#[test]
+fn picked_path_is_capped() {
+    let long = format!("/home/me/{}", "x".repeat(253));
+    let (path, renamed) = picked(&WORD, &long, "pdf");
+    let file = path.rsplit('/').next().unwrap_or_default();
+    assert!(renamed && file.len() <= MAX_FILE_NAME_BYTES && file.ends_with("x.pdf"), "{}", file.len());
+    assert!(path.starts_with("/home/me/"));
+    let wide = format!("/d/{}", "é".repeat(200));
+    let (path, _) = picked(&WORD, &wide, "pdf");
+    assert!(path.trim_start_matches("/d/").len() <= MAX_FILE_NAME_BYTES && path.ends_with("é.pdf"));
+}
+
+#[test]
+fn plan_for_formats_sharing_an_extension() {
+    for runtime in [Runtime::Desktop, Runtime::WebHosted] {
+        let Ok(xml) = WORD.plan(runtime, "n.docx", "D", "xml") else { panic!("xml") };
+        let Ok(old) = WORD.plan(runtime, "n.docx", "D", "wordml2003") else { panic!("2003") };
+        assert_eq!(xml.file_name, old.file_name);
+        assert_ne!(xml.format.id, old.format.id);
+        assert_eq!(xml.delivery, runtime.save_as_delivery());
+    }
 }
