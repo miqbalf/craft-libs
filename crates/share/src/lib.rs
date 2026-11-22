@@ -10,6 +10,9 @@
 //! - **Anything else** ([`ShareRoute::None`]): the app shows [`NO_NEXTCLOUD`], translated in its
 //!   own catalog.
 //!
+//! Save As = Export lives in [`export`]: one format list per app, the file-naming rule, and the
+//! delivery per platform (a download on the web, framed or not; the save dialog on the desktop).
+//!
 //! The crate depends on std and serde only: the apps link it from the miqbalf craft-libs fork next
 //! to their storytold `craft-*` pins, so it must not pull in a second copy of any `craft-*` crate.
 
@@ -17,6 +20,7 @@
 
 pub mod config;
 mod desktop;
+pub mod export;
 mod path;
 mod url;
 
@@ -76,5 +80,7 @@ impl ShareRoute {
     }
 }
 
+#[cfg(test)]
+mod export_tests;
 #[cfg(test)]
 mod tests;

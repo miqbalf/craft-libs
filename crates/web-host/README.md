@@ -5,7 +5,7 @@ The host messages between a Craft app's web build and the page that hosts it, as
 The crate has two parts:
 
 - **The contract** (all targets): the message kinds and their `<app>:<kind>` types, the contract version, how the hosting mode is read from the URL and the canvas, and the clean-up of file names a host passes in. Pure, tested natively.
-- **The bridge** (`web`, wasm32 only): `Host::connect(app, canvas)` finds the host, `listen` hears its messages, and `post_ready` (or `post_ready_with` for an app with its own Share button), `post_save`, `post_dirty`, `post_failed`, `post_handoff` and `post_share` answer it. `web::download(name, mime, bytes)` downloads a copy in the browser (a `Blob` and a hidden `<a download>`). Only the same-origin parent window is heard and answered; with a parent on another origin the app runs as if unframed.
+- **The bridge** (`web`, wasm32 only): `Host::connect(app, canvas)` finds the host, `listen` hears its messages, and `post_ready` (or `post_ready_with` for an app with its own Share button), `post_save`, `post_dirty`, `post_failed`, `post_handoff` and `post_share` answer it. `web::download(name, mime, bytes)` downloads a copy in the browser (a `Blob` and a hidden `<a download>`): every Save As / Export copy on the web goes this way, framed or not (`craft-share`'s `export` module), never as `save`. Only the same-origin parent window is heard and answered; with a parent on another origin the app runs as if unframed.
 
 ## Messages
 
