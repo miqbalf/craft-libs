@@ -1,0 +1,19 @@
+[package]
+name = "craft-share"
+description = "Where a Craft app's Share button goes: the Nextcloud page hosting the web build, the Nextcloud desktop client's synced folder, or nowhere (\"No Nextcloud connected\")."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# std and serde only: the apps link this crate from a second craft-libs source (the miqbalf fork)
+# next to their storytold craft-* pins, so it must not depend on any other craft-* crate.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
