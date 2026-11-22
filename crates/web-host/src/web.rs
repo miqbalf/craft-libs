@@ -367,29 +367,38 @@ pub async fn fetch_font(font: &FontRef) -> Result<Vec<u8>, String> {
 
 /// Download `bytes` as a file named `name` (cleaned with [`file_name`]) of type `mime` (empty:
 /// `application/octet-stream`): a `Blob`, an object URL and a hidden `<a download>` clicked once.
-/// The URL is revoked ten seconds later; the download keeps its own reference. Works framed or
+/// The URL is revoked ten seconds later (at once if the anchor or the timer fails); the download
+/// keeps its own reference. Works framed or
 /// not, with no host message.
 pub fn download(name: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
     let js = |e: JsValue| e.as_string().unwrap_or_else(|| format!("{e:?}"));
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
+    let body = document.body().ok_or("no body")?;
+    let anchor: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
+    anchor.set_download(&file_name(Some(name), "download"));
+    anchor.style().set_property("display", "none").map_err(js)?;
     let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
     let options = web_sys::BlobPropertyBag::new();
     options.set_type(if mime.is_empty() { "application/octet-stream" } else { mime });
     let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options).map_err(js)?;
+    // From here on the object URL exists: every way out revokes it.
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
-    let anchor: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
     anchor.set_href(&url);
-    anchor.set_download(&file_name(Some(name), "download"));
-    anchor.style().set_property("display", "none").map_err(js)?;
-    let body = document.body().ok_or("no body")?;
-    body.append_child(&anchor).map_err(js)?;
+    if let Err(e) = body.append_child(&anchor) {
+        let _ = web_sys::Url::revoke_object_url(&url);
+        return Err(js(e));
+    }
     anchor.click();
     anchor.remove();
+    let later = url.clone();
     let revoke = Closure::once_into_js(move || {
-        let _ = web_sys::Url::revoke_object_url(&url);
+        let _ = web_sys::Url::revoke_object_url(&later);
     });
-    window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
+    if window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).is_err() {
+        // No timer: revoke now rather than leak it. The click has already started the download.
+        let _ = web_sys::Url::revoke_object_url(&url);
+    }
     Ok(())
 }
 
