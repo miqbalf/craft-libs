@@ -271,7 +271,7 @@ impl<'a> Files<'a> {
 <d:lockinfo xmlns:d="DAV:">
   <d:lockscope><d:exclusive/></d:lockscope>
   <d:locktype><d:write/></d:locktype>
-  <d:owner><d:href>{}</d:href></d:owner>
+  <d:owner>{}</d:owner>
 </d:lockinfo>"#,
             craft_xml::esc(self.account.user())
         );
@@ -377,6 +377,24 @@ fn granted_timeout(header: &str) -> Option<u32> {
     secs.parse().ok()
 }
 
+/// The text of a lock holder's name without markup. For a WebDAV lock (`nc:lock-owner-type` 2)
+/// Nextcloud 35 names the holder with the `d:owner` content of the LOCK request as it was sent,
+/// so `<d:owner><d:href>alice</d:href></d:owner>` comes back as the escaped text
+/// `<d:href xmlns:d="DAV:">alice</d:href>`. Seen on workspace.treeo.id, 2026-11-27.
+fn markup_free(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_owned()
+}
+
 /// Build an [`Entry`] from one `response`, whose decoded path relative to the files root is
 /// `relative` (starting with `/`). Every property is optional.
 fn entry_from(response: &craft_xml::El, relative: &str) -> Entry {
@@ -400,7 +418,7 @@ fn entry_from(response: &craft_xml::El, relative: &str) -> Entry {
             "nc:lock" => lock = text,
             "nc:lock-owner" => lock_owner = Some(text).filter(|t| !t.is_empty()),
             "nc:lock-owner-type" => lock_type = text,
-            "nc:lock-owner-displayname" => lock_name = Some(text).filter(|t| !t.is_empty()),
+            "nc:lock-owner-displayname" => lock_name = Some(markup_free(&text)).filter(|t| !t.is_empty()),
             _ => {}
         }
     }

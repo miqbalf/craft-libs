@@ -423,6 +423,30 @@ fn lock_reads_holder_and_kind() {
 }
 
 #[test]
+fn a_webdav_lock_holder_is_named_without_markup() {
+    // Nextcloud 35 echoes a WebDAV lock's `d:owner` content as the holder's display name.
+    let docs = "/remote.php/dav/files/u/Docs";
+    let own = item(&format!("{docs}/"), "<d:resourcetype><d:collection/></d:resourcetype>");
+    let held = item(
+        &format!("{docs}/a.docx"),
+        "<d:resourcetype/><nc:lock>1</nc:lock><nc:lock-owner>bob</nc:lock-owner><nc:lock-owner-displayname>&lt;d:href xmlns:d=&quot;DAV:&quot;&gt;bob&lt;/d:href&gt;</nc:lock-owner-displayname><nc:lock-owner-type>2</nc:lock-owner-type>",
+    );
+    let http = Fake::new(vec![multistatus(&format!("{own}{held}"))]);
+    let e = Files::new(&account()).list(&http, "/Docs").unwrap();
+    let name = e[0].lock.clone().and_then(|l| l.name).unwrap_or_default();
+    assert!(!name.contains('<') && name.contains("bob"), "{name}");
+}
+
+#[test]
+fn lock_names_the_owner_as_plain_text() {
+    let http = Fake::new(vec![Response::new(200, "").header("Lock-Token", "<opaquelocktoken:t1>")]);
+    Files::new(&account()).lock(&http, "/a.docx", 300).unwrap();
+    let body = body_text(&http.requests()[0]);
+    let owner = body.split("<d:owner>").nth(1).and_then(|r| r.split("</d:owner>").next()).unwrap_or_default();
+    assert!(!owner.is_empty() && !owner.contains('<'), "{body}");
+}
+
+#[test]
 fn search_reads_lock_too() {
     let locked = item(
         "/remote.php/dav/files/u/a.docx",
