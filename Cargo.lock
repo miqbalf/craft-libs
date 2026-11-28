@@ -3234,6 +3234,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-share"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "craft-sheet"
 version = "0.1.0"
 
@@ -3610,7 +3618,9 @@ dependencies = [
 name = "craft-web-host"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
 ]

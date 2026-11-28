@@ -6,19 +6,27 @@
 //!
 //! | Kind | Direction | Fields |
 //! |---|---|---|
-//! | `ready` | app → host | `version`, `appVersion?`, `file?` (`true`: it reads a `File`/`Blob` in slices) |
-//! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs) |
+//! | `ready` | app → host | `version`, `appVersion?`, `file?` (`true`: it reads a `File`/`Blob` in slices), `shareButton?` (`true`: the app has its own Share button) |
+//! | `host` | host → app | `version`, `handoff?` (`true`: the host routes hand-offs), `saves?` (`true`: the host stores saves), `share?` (`true`: the host opens Nextcloud sharing on `share`) |
 //! | `open` | host → app | `name`, and `bytes` or `file` + `size` |
 //! | `attach-pdf` | host → app | `name`, `bytes`, `page` (from 1), `insertion` ([x,y,z]), `width`, `height` in drawing units |
 //! | `save` | app → host | `name`, `bytes`, `id?`, `saveAs?` |
-//! | `saved` | host → app | `id` |
+//! | `saved` | host → app | `id`, `name?` (the host stored the save under another name: a conflict copy, or Save As) |
+//! | `save-failed` | host → app | `id`, `error` (the host could not store the save) |
+//! | `fonts` | host → app | `fonts`: `[{name, url}]`, same-origin font files for the app to fetch and install |
 //! | `dirty` | app → host | `dirty` |
 //! | `failed` | app → host | `error`, `id?` |
 //! | `handoff` | app → host | `name`, and `bytes` or `file` + `size` |
 //! | `handoff-done` | host → app | `name`, `app` |
+//! | `share` | app → host | none: open the host's sharing for the open file (only after `host` said `share: true`) |
 //!
-//! A host answers `saved` only for a `save` that carries an `id`; an app that sends none treats a
-//! save as done once it is posted. Fields marked `?` are optional, so the bridges shipped before
+//! A host answers `saved` or `save-failed` only for a `save` that carries an `id`; an app that sends
+//! none treats a save as done once it is posted. When `host` has no `saves`, the app keeps its
+//! earlier behaviour (a download, never marked saved). With `saves`, the app marks a document saved
+//! only when `saved` arrives for its `id`, and stays unsaved and shows the error on `save-failed`.
+//! A live document is saved by its live session, not by `save`. A host sends at most
+//! [`MAX_FONTS`] fonts in `fonts` (the rest are dropped), each fetched from this origin only and
+//! at most [`MAX_FONT_BYTES`] long. Fields marked `?` are optional, so the bridges shipped before
 //! this crate already speak version 1. Those bridges put the app's own release in `ready`'s
 //! `version` (`"0.14.0"`): a host treats any `version` it doesn't know as `"1"`.
 //!
@@ -32,6 +40,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
+pub mod live;
+
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
@@ -41,6 +51,12 @@ pub const VERSION: &str = "1";
 
 /// Longest file name taken from a host or put in a message, in characters.
 pub const MAX_NAME_CHARS: usize = 255;
+
+/// Most entries taken from one `fonts` message; later ones are dropped.
+pub const MAX_FONTS: usize = 64;
+
+/// Longest font file an app takes from a host, in bytes (20 MB).
+pub const MAX_FONT_BYTES: usize = 20 * 1_000_000;
 
 /// How a page hosts the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +91,7 @@ pub enum Outgoing {
     Dirty,
     Failed,
     Handoff,
+    Share,
 }
 
 /// What a host sends to an app.
@@ -84,6 +101,8 @@ pub enum Incoming {
     Open,
     AttachPdf,
     Saved,
+    SaveFailed,
+    Fonts,
     HandoffDone,
 }
 
@@ -95,12 +114,13 @@ impl Outgoing {
             Self::Dirty => "dirty",
             Self::Failed => "failed",
             Self::Handoff => "handoff",
+            Self::Share => "share",
         }
     }
 }
 
 impl Incoming {
-    pub const ALL: [Self; 5] = [Self::Host, Self::Open, Self::AttachPdf, Self::Saved, Self::HandoffDone];
+    pub const ALL: [Self; 7] = [Self::Host, Self::Open, Self::AttachPdf, Self::Saved, Self::SaveFailed, Self::Fonts, Self::HandoffDone];
 
     pub const fn kind(self) -> &'static str {
         match self {
@@ -108,6 +128,8 @@ impl Incoming {
             Self::Open => "open",
             Self::AttachPdf => "attach-pdf",
             Self::Saved => "saved",
+            Self::SaveFailed => "save-failed",
+            Self::Fonts => "fonts",
             Self::HandoffDone => "handoff-done",
         }
     }
@@ -125,6 +147,31 @@ pub fn message_type(app: &str, kind: &str) -> String {
     format!("{app}:{kind}")
 }
 
+/// One field value of an app's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Field {
+    Str(String),
+    Bool(bool),
+}
+
+/// The fields of `<app>:ready`: `version`, `appVersion`, `file`, and `shareButton: true` when the
+/// app has its own Share button (so the host shows none of its own). Without a Share button the
+/// field is left out, so the message stays what the earlier bridges sent.
+pub fn ready_fields(app_version: &str, reads_files: bool, share_button: bool) -> Vec<(&'static str, Field)> {
+    let mut fields =
+        vec![("version", Field::Str(VERSION.to_string())), ("appVersion", Field::Str(app_version.to_string())), ("file", Field::Bool(reads_files))];
+    if share_button {
+        fields.push(("shareButton", Field::Bool(true)));
+    }
+    fields
+}
+
+/// A `host` message's flag (`handoff`, `saves`, `share`): on only for a JSON `true`, so a host that
+/// says `"true"`, `1` or nothing gets the earlier behaviour.
+pub fn host_flag(value: Option<bool>) -> bool {
+    value == Some(true)
+}
+
 /// A file name from a host, made safe to show and save under: path separators and control
 /// characters dropped, surrounding space trimmed, at most [`MAX_NAME_CHARS`] characters, and
 /// `fallback` when nothing is left.
@@ -136,6 +183,90 @@ pub fn file_name(raw: Option<&str>, fallback: &str) -> String {
         return fallback.to_string();
     }
     trimmed.chars().take(MAX_NAME_CHARS).collect()
+}
+
+/// A font the host offers: a display `name` and a same-origin `url` to fetch it from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontRef {
+    pub name: String,
+    pub url: String,
+}
+
+/// Whether `url` is on `origin` (`https://host:port`, no trailing slash): an absolute path
+/// (`/fonts/a.ttf`, not `//other/…`) or a full URL that starts with the origin and a `/`.
+/// Backslashes and control characters are refused, as browsers treat `\` like `/`.
+pub fn is_same_origin(url: &str, origin: &str) -> bool {
+    if url.is_empty() || url.contains('\\') || url.chars().any(char::is_control) {
+        return false;
+    }
+    if let Some(path) = url.strip_prefix('/') {
+        return !path.starts_with('/');
+    }
+    !origin.is_empty() && url.strip_prefix(origin).is_some_and(|rest| rest.starts_with('/') && !rest.starts_with("//"))
+}
+
+/// The usable fonts of a host's list, given as `(name, url)` pairs as read (either may be
+/// missing). An entry with no url, a url off `origin`, or an empty name after cleaning with
+/// [`file_name`] is dropped; the first [`MAX_FONTS`] entries are looked at, so a longer list is cut.
+pub fn font_list<'a>(entries: impl IntoIterator<Item = (Option<&'a str>, Option<&'a str>)>, origin: &str) -> Vec<FontRef> {
+    entries
+        .into_iter()
+        .take(MAX_FONTS)
+        .filter_map(|(name, url)| {
+            let url = url.filter(|u| is_same_origin(u, origin))?;
+            let fallback = url.rsplit('/').next().unwrap_or_default();
+            let name = file_name(name, fallback);
+            (!name.is_empty()).then(|| FontRef { name, url: url.to_string() })
+        })
+        .collect()
+}
+
+/// A font file of `len` bytes is within [`MAX_FONT_BYTES`] (and not empty).
+pub fn font_size_ok(len: f64) -> bool {
+    len.is_finite() && len > 0.0 && len <= MAX_FONT_BYTES as f64
+}
+
+/// The saves an app has sent and not yet seen answered. An app takes an id from [`Self::start`],
+/// posts the save with it, and acts on `saved` or `save-failed` only when [`Self::finish`] says the
+/// id was waiting: an answer for an unknown, stale or repeated id changes nothing.
+#[derive(Debug, Default)]
+pub struct PendingSaves {
+    next: u64,
+    waiting: Vec<String>,
+}
+
+impl PendingSaves {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A new id for a save that is about to be posted.
+    pub fn start(&mut self) -> String {
+        self.next += 1;
+        let id = format!("save-{}", self.next);
+        self.waiting.push(id.clone());
+        id
+    }
+
+    /// The host answered `id`: true the first time for an id that was waiting.
+    pub fn finish(&mut self, id: &str) -> bool {
+        match self.waiting.iter().position(|w| w == id) {
+            Some(at) => {
+                self.waiting.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The post for `id` failed, so no answer will come.
+    pub fn cancel(&mut self, id: &str) {
+        self.finish(id);
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
 }
 
 /// Remember `next` before the send. A page host can, while that send is still
@@ -213,6 +344,30 @@ mod tests {
     }
 
     #[test]
+    fn share_is_an_outgoing_kind_and_never_incoming() {
+        // The wire name WordCraft's sh/host-share bridge already posts.
+        assert_eq!(message_type("wordcraft", Outgoing::Share.kind()), "wordcraft:share");
+        assert_eq!(Incoming::parse("wordcraft", "wordcraft:share"), None, "share goes app to host only");
+    }
+
+    #[test]
+    fn ready_says_share_button_only_when_the_app_has_one() {
+        let names = |share: bool| ready_fields("0.14.0", false, share).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        assert_eq!(names(false), ["version", "appVersion", "file"], "the earlier ready, unchanged");
+        let with = ready_fields("0.14.0", false, true);
+        assert!(with.contains(&("shareButton", Field::Bool(true))));
+        assert!(with.contains(&("version", Field::Str(VERSION.to_string()))));
+        assert_eq!(with.len(), names(false).len() + 1);
+    }
+
+    #[test]
+    fn a_host_flag_is_on_only_for_true() {
+        assert!(host_flag(Some(true)));
+        assert!(!host_flag(Some(false)));
+        assert!(!host_flag(None));
+    }
+
+    #[test]
     fn host_file_names_are_cleaned() {
         assert_eq!(file_name(Some("plan.dxf"), "Drawing.dxf"), "plan.dxf");
         assert_eq!(file_name(Some("  ../../etc/passwd "), "x"), "passwd");
@@ -245,6 +400,92 @@ mod tests {
         });
         assert!(!sent);
         assert_eq!(dirty.get(), Some(true));
+    }
+
+    #[test]
+    fn the_save_and_font_kinds_are_the_hosts_and_parse() {
+        assert_eq!(Incoming::parse("wordcraft", "wordcraft:save-failed"), Some(Incoming::SaveFailed));
+        assert_eq!(Incoming::parse("wordcraft", "wordcraft:fonts"), Some(Incoming::Fonts));
+        assert_eq!(Incoming::parse("wordcraft", "wordcraft:save"), None, "save stays app to host");
+    }
+
+    const ORIGIN: &str = "https://cloud.example";
+
+    #[test]
+    fn only_urls_on_this_origin_are_same_origin() {
+        for ok in ["/fonts/a.ttf", "https://cloud.example/f/a.ttf", "/index.php/apps/x/fonts/Barlow%20Bold.ttf"] {
+            assert!(is_same_origin(ok, ORIGIN), "{ok}");
+        }
+        for bad in [
+            "",
+            "//evil.example/a.ttf",
+            "https://evil.example/a.ttf",
+            "https://cloud.example.evil.example/a.ttf",
+            "https://cloud.example@evil.example/a.ttf",
+            "https://cloud.example",
+            "https://cloud.example//evil.example/a.ttf",
+            "http://cloud.example/a.ttf",
+            "a.ttf",
+            "data:font/ttf;base64,AAAA",
+            "blob:https://cloud.example/x",
+            "/\\evil.example/a.ttf",
+            "https://cloud.example/\\evil",
+            "/a\n.ttf",
+        ] {
+            assert!(!is_same_origin(bad, ORIGIN), "{bad:?}");
+        }
+        assert!(!is_same_origin("https://cloud.example/a.ttf", ""), "no known origin accepts no full URL");
+    }
+
+    #[test]
+    fn a_font_list_keeps_usable_entries_and_cuts_at_the_cap() {
+        let list = font_list(
+            [
+                (Some("Barlow"), Some("/f/barlow.ttf")),
+                (Some("Evil"), Some("https://evil.example/e.ttf")),
+                (Some("Nourl"), None),
+                (None, Some("/f/Aptos-Regular.ttf")),
+                (Some("../../x"), Some("/f/x.ttf")),
+            ],
+            ORIGIN,
+        );
+        let names: Vec<_> = list.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["Barlow", "Aptos-Regular.ttf", "x"]);
+
+        let many: Vec<String> = (0..MAX_FONTS + 30).map(|i| format!("/f/{i}.ttf")).collect();
+        let list = font_list(many.iter().map(|u| (Some("n"), Some(u.as_str()))), ORIGIN);
+        assert_eq!(list.len(), MAX_FONTS);
+        assert!(list.last().is_some_and(|f| f.url == format!("/f/{}.ttf", MAX_FONTS - 1)), "the first entries are kept");
+
+        // An off-origin entry still counts toward the cap, so a host cannot pad past it.
+        let mut mixed: Vec<(Option<&str>, Option<&str>)> = vec![(Some("e"), Some("https://evil.example/e.ttf")); MAX_FONTS];
+        mixed.push((Some("late"), Some("/f/late.ttf")));
+        assert!(font_list(mixed, ORIGIN).is_empty());
+    }
+
+    #[test]
+    fn a_font_over_the_byte_cap_is_refused() {
+        assert!(font_size_ok(1.0));
+        assert!(font_size_ok(MAX_FONT_BYTES as f64));
+        assert!(!font_size_ok(MAX_FONT_BYTES as f64 + 1.0));
+        assert!(!font_size_ok(0.0));
+        assert!(!font_size_ok(f64::NAN));
+        assert!(!font_size_ok(f64::INFINITY));
+    }
+
+    #[test]
+    fn a_save_is_resolved_once_and_only_for_its_own_id() {
+        let mut saves = PendingSaves::new();
+        let (a, b) = (saves.start(), saves.start());
+        assert_ne!(a, b);
+        assert!(saves.is_waiting());
+        assert!(!saves.finish("other"), "an unknown id changes nothing");
+        assert!(saves.finish(&b));
+        assert!(!saves.finish(&b), "a repeated answer changes nothing");
+        assert!(saves.is_waiting(), "a is still waiting");
+        saves.cancel(&a);
+        assert!(!saves.is_waiting());
+        assert!(!saves.finish(&a), "a cancelled save is never confirmed later");
     }
 
     #[test]
