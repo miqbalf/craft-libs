@@ -2706,6 +2706,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-nextcloud"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "craft-cloud",
+ "craft-dav",
+ "craft-xml",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-odf"
 version = "0.1.0"
 dependencies = [

@@ -221,9 +221,10 @@ pub fn is_self_updating(app: &App) -> bool {
 
 /// [`is_self_updating`] for a known executable and opt-in setting. On Windows the update helper
 /// installs nothing for an unsigned copy, so only a signed one is offered the update; [`DEV_VAR`]
-/// still offers it, to try the self-update.
+/// still offers it, to try the self-update, and so does a udinCraft fork app, whose builds are
+/// unsigned ([`crate::fork`]).
 fn can_self_update_at(app: &App, exe: &Path, opted_in: bool) -> bool {
-    current_at(app, exe, opted_in).is_some() && (opted_in || is_signed(exe))
+    current_at(app, exe, opted_in).is_some() && (opted_in || crate::fork::is_fork_app(app) || is_signed(exe))
 }
 
 /// Whether `exe` carries a valid Authenticode signature.
@@ -888,8 +889,16 @@ pub fn prepare_update_with_options(
                     installation: None,
                 };
                 let wait = install::macos::CheckTurn { stop, phase: &mut *phase };
-                let placed =
-                    install::macos::install_dmg(app, &file, Some(&existing), None, false, paths, &install::macos::Expect::self_update(release), wait);
+                let placed = install::macos::install_dmg(
+                    app,
+                    &file,
+                    Some(&existing),
+                    None,
+                    false,
+                    paths,
+                    &install::macos::Expect::for_self_update(app, release),
+                    wait,
+                );
                 after_install(paths, &file, recorded, &placed);
                 let placed = placed?;
                 Ok(relaunch_after_exit(app, pid, &[Path::new("/usr/bin/open").as_os_str(), placed.as_os_str()]))
@@ -1705,10 +1714,9 @@ fn same_cache_as_helper(app: &App, paths: &Paths, exe: &Path) -> Result<(), Stri
 /// `reference` itself isn't signed.
 #[cfg(windows)]
 fn signed_like(app: &App, reference: &Path, file: &Path) -> Result<(), String> {
-    let publisher = |path: &Path| verifysign::verify_file(path).map(|signature| signature.subject_name());
-    let ours = publisher(reference).map_err(|e| format!("this copy of {} isn't signed ({e}), so it doesn't install updates", app.name))?;
-    let theirs = publisher(file).map_err(|e| format!("{} isn't signed ({e})", file.display()))?;
-    if ours == theirs { Ok(()) } else { Err(format!("{} isn't signed by {}'s publisher", file.display(), app.name)) }
+    let publisher = |path: &Path| verifysign::verify_file(path).map(|signature| signature.subject_name()).map_err(|e| e.to_string());
+    // udinCraft: an unsigned fork copy accepts its fork release's files (see `crate::fork`).
+    crate::fork::publisher_check(app, &file.display().to_string(), publisher(reference), publisher(file))
 }
 
 /// Whether `file` is a Windows program or library (it starts with the `MZ` header), whatever its
@@ -3139,6 +3147,27 @@ mod tests {
         assert!(can_self_update_at(&crate::suite::LAUNCHER, &system_program("cmd.exe"), false));
     }
 
+    /// udinCraft: the fork's unsigned copy installs its unsigned release (its SHA-256 was checked
+    /// against the release's checksums) and is offered the self-update; the upstream app's copy,
+    /// as above, is not.
+    #[cfg(windows)]
+    #[test]
+    fn udincraft_an_unsigned_fork_copy_installs_its_unsigned_release() {
+        let fork = App { repo: "miqbalf/craft-launcher", ..crate::suite::LAUNCHER };
+        let dir = tempfile::tempdir().unwrap();
+        let unsigned = dir.path().join("artcraft-launcher.exe");
+        std::fs::write(&unsigned, "MZ").unwrap();
+        std::fs::write(dir.path().join("portable.txt"), "").unwrap();
+        let msi = dir.path().join("artcraft-launcher-0.2.0-windows-x64.msi");
+        std::fs::write(&msi, "an unsigned package").unwrap();
+        assert!(can_self_update_at(&fork, &unsigned, false));
+        assert!(!can_self_update_at(&crate::suite::LAUNCHER, &unsigned, false));
+        assert_eq!(signed_like(&fork, &unsigned, &msi), Ok(()));
+        assert!(signed_like(&crate::suite::LAUNCHER, &unsigned, &msi).is_err());
+        // A signed copy, fork or not, still wants its own publisher.
+        assert!(signed_like(&fork, &system_program("cmd.exe"), &msi).is_err_and(|e| e.contains("isn't signed")));
+    }
+
     /// An unsigned launcher says so before it quits for an update. `cargo test` binaries are
     /// unsigned, like a package built without the signing secrets.
     #[cfg(windows)]
@@ -3553,7 +3582,7 @@ mod tests {
             installation: None,
         };
         // An unsigned test bundle: the signature check has its own tests in `install`.
-        let expect = install::macos::Expect { team: None, version: None, quit_first: false };
+        let expect = install::macos::Expect { team: None, version: None, quit_first: false, fork_identifier: None };
         let stop = Stop::default();
         let wait = install::macos::CheckTurn { stop: &stop, phase: &mut |_| {} };
         let _other_processes = install::macos::other_test_processes_wait();
