@@ -60,4 +60,4 @@ jobs:
           toolchain: stable
           components: clippy
       - run: cargo clippy -p craft-update --all-targets --locked -- -D warnings
-      - run: cargo test -p craft-update --locked --lib -- udincraft fork:: macos_checks signed only_a_signed_copy --nocapture
+      - run: "cargo test -p craft-update --locked --lib -- udincraft fork::tests macos_checks signed_by_the_launchers signed_copy unsigned --nocapture"
