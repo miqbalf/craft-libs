@@ -40,3 +40,24 @@ jobs:
           components: clippy
       - run: cargo clippy -p craft-update --all-targets --locked --features egui -- -D warnings
       - run: cargo test -p craft-update --locked --features egui -- --nocapture
+
+  # udinCraft: the fork's install checks (ad-hoc bundles on macOS, unsigned MSI and programs on
+  # Windows) against the real codesign and Authenticode, beside the upstream checks they leave alone.
+  udincraft:
+    name: udinCraft fork installs on ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: step-security/dtolnay-rust-toolchain@v1.0.0
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy -p craft-update --all-targets --locked -- -D warnings
+      - run: cargo test -p craft-update --locked --lib -- udincraft fork:: macos_checks signed only_a_signed_copy --nocapture

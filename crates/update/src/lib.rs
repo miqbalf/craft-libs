@@ -7,6 +7,7 @@ pub mod desktop_entry;
 pub mod detect;
 pub mod distro;
 mod folders;
+pub mod fork;
 pub mod http;
 pub mod install;
 pub mod manifest;

@@ -129,7 +129,7 @@ pub fn install_at(
         #[cfg(target_os = "macos")]
         PackageKind::Dmg => {
             let wait = macos::CheckTurn { stop: job.stop, phase: &mut *job.phase };
-            macos::install_dmg(app, &file, existing, destination.as_deref(), job.replace, job.paths, &macos::Expect::release(release), wait)
+            macos::install_dmg(app, &file, existing, destination.as_deref(), job.replace, job.paths, &macos::Expect::for_release(app, release), wait)
                 .map(|path| Some(record(&version, kind, path, Vec::new(), false)))
         }
         #[cfg(windows)]
@@ -1642,16 +1642,34 @@ pub mod macos {
         /// Refuse the swap when the app it replaces is running. `false` for an app replacing
         /// itself, which is running on purpose.
         pub quit_first: bool,
+        /// udinCraft: the bundle identifier of a fork release's ad-hoc signed bundle, checked
+        /// instead of a team when `team` is `None` ([`crate::fork`]).
+        pub fork_identifier: Option<String>,
     }
 
     impl<'a> Expect<'a> {
         pub fn release(release: &'a Release) -> Self {
-            Self { team: Some(TEAM_ID), version: release.version.as_ref(), quit_first: true }
+            Self { team: Some(TEAM_ID), version: release.version.as_ref(), quit_first: true, fork_identifier: None }
         }
 
         /// [`Self::release`] for an app replacing itself.
         pub fn self_update(release: &'a Release) -> Self {
             Self { quit_first: false, ..Self::release(release) }
+        }
+
+        /// [`Self::release`], except for a udinCraft fork release ([`crate::fork::is_fork_release`]):
+        /// its ad-hoc signed bundle must pass `codesign`'s strict verification as `app`'s own
+        /// bundle identifier, with no team. An app whose identifier can't be checked keeps the team.
+        pub fn for_release(app: &App, release: &'a Release) -> Self {
+            match crate::fork::bundle_identifier(app).filter(|_| crate::fork::is_fork_release(app, release)) {
+                Some(id) => Self { team: None, fork_identifier: Some(id), ..Self::release(release) },
+                None => Self::release(release),
+            }
+        }
+
+        /// [`Self::for_release`] for an app replacing itself.
+        pub fn for_self_update(app: &App, release: &'a Release) -> Self {
+            Self { quit_first: false, ..Self::for_release(app, release) }
         }
     }
 
@@ -1879,6 +1897,14 @@ pub mod macos {
                 Signature::Failed(reason) => return Err(format!("the app failed its signature check ({reason}), so it wasn't installed")),
                 Signature::Unchecked(reason) => return Err(format!("the app's signature couldn't be checked ({reason}), so it wasn't installed")),
             }
+        } else if let Some(id) = expect.fork_identifier.as_deref() {
+            match fork_signature(bundle, id, run, wait) {
+                Signature::Valid => {}
+                Signature::Canceled => return Err(CANCELLED.into()),
+                Signature::Wrong => return Err("the app isn't the udinCraft build it should be, so it wasn't installed".into()),
+                Signature::Failed(reason) => return Err(format!("the app failed its signature check ({reason}), so it wasn't installed")),
+                Signature::Unchecked(reason) => return Err(format!("the app's signature couldn't be checked ({reason}), so it wasn't installed")),
+            }
         }
         if let Some(want) = expect.version
             && !found.version.as_ref().is_some_and(|v| same_release(v, want))
@@ -1928,6 +1954,29 @@ pub mod macos {
             Ok(_) => Signature::Valid,
             // codesign(1): 3 is a signature that fails the requirement, and 1 any other failed
             // verification.
+            Err(HelperFailure::Exited { code: 3, .. }) => Signature::Wrong,
+            Err(HelperFailure::Exited { code: 1, reason }) => Signature::Failed(reason),
+            Err(failure) => Signature::Unchecked(failure.into_reason()),
+        };
+        SIGNATURE_CHECKS.alone(&cancelled(wait.stop), &mut turn(wait.phase, JobPhase::Installing), verify).unwrap_or(Signature::Canceled)
+    }
+
+    /// udinCraft: checks a fork build's ad-hoc signature through `run`, one bundle at a time. The
+    /// signature must be intact over every file and architecture (`--deep --strict`), and the
+    /// bundle must be `identifier`. No team is asked for: the fork's builds have none.
+    pub(crate) fn fork_signature(
+        bundle: &Path,
+        identifier: &str,
+        run: impl FnOnce(&str, &[&str], Duration) -> Result<String, HelperFailure>,
+        wait: CheckTurn<'_>,
+    ) -> Signature {
+        let Some(path) = bundle.to_str() else { return Signature::Unchecked("unusual characters in the app's path".into()) };
+        if identifier.is_empty() || !identifier.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+            return Signature::Wrong;
+        }
+        let requirement = format!("=identifier \"{identifier}\"");
+        let verify = || match run(CODESIGN, &["--verify", "--deep", "--strict", "--all-architectures", "-R", &requirement, path], CODESIGN_TIMEOUT) {
+            Ok(_) => Signature::Valid,
             Err(HelperFailure::Exited { code: 3, .. }) => Signature::Wrong,
             Err(HelperFailure::Exited { code: 1, reason }) => Signature::Failed(reason),
             Err(failure) => Signature::Unchecked(failure.into_reason()),
@@ -4373,7 +4422,7 @@ exit 0
             std::fs::create_dir(&apps).unwrap();
             let paths = Paths::under(dir.path());
             let image = dmg(dir.path(), "0.6.0");
-            let expect = Expect { team: None, version: None, quit_first: false };
+            let expect = Expect { team: None, version: None, quit_first: false, fork_identifier: None };
             let placed = install_dmg(photocraft(), &image, None, Some(&apps), false, &paths, &expect).unwrap();
             assert_eq!(placed, apps.join("PhotoCraft.app"));
             let mut manifest = crate::manifest::Manifest::default();
@@ -4405,7 +4454,7 @@ exit 0
             let unrelated = std::fs::read_to_string(&plist).unwrap().replace("ai.storyteller.photocraft", "com.example.other");
             std::fs::write(&plist, &unrelated).unwrap();
             let image = dmg(dir.path(), "0.6.0");
-            let expect = Expect { team: None, version: None, quit_first: false };
+            let expect = Expect { team: None, version: None, quit_first: false, fork_identifier: None };
             let result = install_dmg(photocraft(), &image, None, Some(dir.path()), false, &Paths::under(dir.path()), &expect);
             assert!(result.unwrap_err().contains("already exists"));
             assert_eq!(std::fs::read_to_string(plist).unwrap(), unrelated);
@@ -4441,12 +4490,69 @@ exit 0
             assert_eq!(signature(&app, TEAM_ID, crate::process::run_detailed), Signature::Wrong, "an ad-hoc signature");
         }
 
+        /// udinCraft: a fork release's ad-hoc bundle installs when its signature is intact and it
+        /// is the app's own identifier; a tampered, unsigned or different bundle does not. The real
+        /// `codesign` decides.
+        #[test]
+        fn udincraft_an_ad_hoc_build_installs_and_a_tampered_one_does_not() {
+            let dir = tempfile::tempdir().unwrap();
+            let app = bundle(dir.path(), "0.6.0");
+            let expect = |id: &str| Expect { team: None, version: None, quit_first: false, fork_identifier: Some(id.into()) };
+            let own = expect("ai.storyteller.photocraft");
+            let unsigned = check(&app, &found_at(&app), &own, crate::process::run_detailed).unwrap_err();
+            assert!(unsigned.contains("signature check"), "an unsigned bundle: {unsigned}");
+            let ok = std::process::Command::new("codesign").args(["--force", "--sign", "-"]).arg(&app).status().unwrap().success();
+            assert!(ok, "codesign failed");
+            assert_eq!(check(&app, &found_at(&app), &own, crate::process::run_detailed), Ok(()), "the ad-hoc build");
+            let other = check(&app, &found_at(&app), &expect("ai.storyteller.wordcraft"), crate::process::run_detailed).unwrap_err();
+            assert!(other.contains("udinCraft build"), "another identifier: {other}");
+            // The same bundle with its program changed after signing.
+            std::fs::write(app.join("Contents/MacOS/PhotoCraft"), "tampered").unwrap();
+            let tampered = check(&app, &found_at(&app), &own, crate::process::run_detailed).unwrap_err();
+            assert!(tampered.contains("signature check"), "a tampered bundle: {tampered}");
+            // Still never the team's: an ad-hoc signature fails the upstream check.
+            assert!(!signed_by(&app, TEAM_ID));
+        }
+
+        /// udinCraft: only a fork app's `udincraft-v*` release skips the team, and its check asks
+        /// `codesign` for a strict verification of the app's identifier. The upstream release keeps
+        /// ArtCraft's team exactly as before.
+        #[test]
+        fn udincraft_only_a_fork_release_is_checked_without_the_team() {
+            let fork = App { repo: "miqbalf/photocraft", ..*photocraft() };
+            let release = |tag: &str, repo: &str| Release { tag: tag.into(), repo: repo.into(), ..Release::default() };
+            let ours = release("udincraft-v0.6.0-20261201", "miqbalf/photocraft");
+            let expect = Expect::for_release(&fork, &ours);
+            assert_eq!((expect.team, expect.fork_identifier.as_deref(), expect.quit_first), (None, Some("ai.storyteller.photocraft"), true));
+            assert!(!Expect::for_self_update(&fork, &ours).quit_first);
+            for (app, release) in [
+                (photocraft(), &ours),
+                (&fork, &release("v0.6.0", "miqbalf/photocraft")),
+                (&fork, &release("udincraft-v0.6.0-20261201", "storytold/photocraft")),
+            ] {
+                let expect = Expect::for_release(app, release);
+                assert_eq!((expect.team, expect.fork_identifier), (Some(TEAM_ID), None), "{} {}", app.repo, release.tag);
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let app = bundle(dir.path(), "0.6.0");
+            let mut asked = Vec::new();
+            let result = check(&app, &found_at(&app), &expect, |program, args, _| {
+                asked = std::iter::once(program).chain(args.iter().copied()).map(String::from).collect();
+                Err(HelperFailure::Exited { code: 3, reason: "test-requirement".into() })
+            });
+            assert!(result.unwrap_err().contains("udinCraft build"));
+            assert_eq!(
+                asked[..7],
+                ["/usr/bin/codesign", "--verify", "--deep", "--strict", "--all-architectures", "-R", "=identifier \"ai.storyteller.photocraft\""]
+            );
+        }
+
         /// `codesign` exits 1 for a bundle it can't read too, which says nothing about who signed it.
         #[test]
         fn a_bundle_codesign_cannot_read_is_not_called_unsigned() {
             let dir = tempfile::tempdir().unwrap();
             let gone = dir.path().join("Gone.app");
-            let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: false };
+            let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: false, fork_identifier: None };
             let refusal = check(&gone, &found_at(&gone), &expect, crate::process::run_detailed).unwrap_err();
             assert!(refusal.contains("No such file"), "{refusal}");
             assert!(!refusal.contains("isn't signed"), "{refusal}");
@@ -4467,7 +4573,7 @@ exit 0
         /// What [`check`] says when `codesign` fails with `failure`.
         fn refusal_for(failure: HelperFailure) -> Result<(), String> {
             let bundle = Path::new("/private/owned/PhotoCraft.app");
-            let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: false };
+            let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: false, fork_identifier: None };
             check(bundle, &found_at(bundle), &expect, |_, _, _| Err(failure))
         }
 
@@ -4563,7 +4669,7 @@ exit 0
         fn a_job_canceled_while_it_waits_for_the_signature_check_stops_there() {
             let refused = behind_a_running_check(|_| {
                 let bundle = Path::new("/private/owned/PhotoCraft.app");
-                let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: false };
+                let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: false, fork_identifier: None };
                 let stop = Stop::default();
                 let mut cancel_when_waiting = |p| {
                     if p == JobPhase::Waiting {
@@ -4591,7 +4697,7 @@ exit 0
         fn an_app_opened_during_the_signature_check_is_not_replaced() {
             let dir = tempfile::tempdir().unwrap();
             let (staged, installed) = staged_and_installed(dir.path());
-            let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: true };
+            let expect = Expect { team: Some(TEAM_ID), version: None, quit_first: true, fork_identifier: None };
             let opened = std::cell::Cell::new(false);
             let run = |_: &str, _: &[&str], _: std::time::Duration| {
                 opened.set(true);
@@ -4606,7 +4712,7 @@ exit 0
         fn an_app_whose_state_could_not_be_checked_is_not_replaced() {
             let dir = tempfile::tempdir().unwrap();
             let (staged, installed) = staged_and_installed(dir.path());
-            let expect = Expect { team: None, version: None, quit_first: true };
+            let expect = Expect { team: None, version: None, quit_first: true, fork_identifier: None };
             let result = place_checked(photocraft(), &staged, &installed, &expect, |_, _, _| Ok(String::new()), |_| Err("too slow".into()));
             assert_eq!(result, Err("couldn't check whether PhotoCraft is running (too slow), so nothing was changed".into()));
             assert_eq!(version_at(&installed), "0.5.0");
@@ -4616,7 +4722,7 @@ exit 0
         fn a_closed_app_is_replaced() {
             let dir = tempfile::tempdir().unwrap();
             let (staged, installed) = staged_and_installed(dir.path());
-            let expect = Expect { team: None, version: None, quit_first: true };
+            let expect = Expect { team: None, version: None, quit_first: true, fork_identifier: None };
             place_checked(photocraft(), &staged, &installed, &expect, |_, _, _| Ok(String::new()), |_| Ok(false)).unwrap();
             assert_eq!(version_at(&installed), "0.6.0");
         }
@@ -4625,7 +4731,7 @@ exit 0
         fn an_app_replacing_itself_is_replaced_while_it_runs() {
             let dir = tempfile::tempdir().unwrap();
             let (staged, installed) = staged_and_installed(dir.path());
-            let expect = Expect { team: None, version: None, quit_first: false };
+            let expect = Expect { team: None, version: None, quit_first: false, fork_identifier: None };
             place_checked(photocraft(), &staged, &installed, &expect, |_, _, _| Ok(String::new()), |_| Ok(true)).unwrap();
             assert_eq!(version_at(&installed), "0.6.0");
         }
@@ -4657,7 +4763,7 @@ exit 0
             for (release, ok) in [("0.6.0", true), ("0.7.0", false), ("0.6.0-rc.1", true), ("0.5.0", false)] {
                 std::fs::write(current.join("Contents/MacOS/PhotoCraft"), "0.5.0").unwrap();
                 let want = version::parse(release).unwrap();
-                let expect = Expect { team: None, version: Some(&want), quit_first: false };
+                let expect = Expect { team: None, version: Some(&want), quit_first: false, fork_identifier: None };
                 let result = install_dmg(photocraft(), &image, Some(&existing), None, false, &paths, &expect);
                 assert_eq!(result.is_ok(), ok, "release {release}: {result:?}");
                 let now = std::fs::read_to_string(current.join("Contents/MacOS/PhotoCraft")).unwrap();
@@ -4674,7 +4780,7 @@ exit 0
             // A bundle that names a pre-release must name the release's.
             let rc = dmg(dir.path(), "0.8.0-rc.2");
             let want = version::parse("0.8.0-rc.1").unwrap();
-            let expect = Expect { team: None, version: Some(&want), quit_first: false };
+            let expect = Expect { team: None, version: Some(&want), quit_first: false, fork_identifier: None };
             assert!(install_dmg(photocraft(), &rc, Some(&existing), None, false, &paths, &expect).is_err());
         }
 
@@ -4760,8 +4866,15 @@ exit 0
             bundle(&staging, "0.6.0");
             std::fs::write(staging.join(".artcraft-launcher-staging"), "").unwrap();
 
-            let result =
-                install_dmg(photocraft(), &image, Some(&existing), None, false, &paths, &Expect { team: None, version: None, quit_first: false });
+            let result = install_dmg(
+                photocraft(),
+                &image,
+                Some(&existing),
+                None,
+                false,
+                &paths,
+                &Expect { team: None, version: None, quit_first: false, fork_identifier: None },
+            );
             assert_eq!(result, Ok(current.clone()));
             assert_eq!(std::fs::read_to_string(current.join("Contents/MacOS/PhotoCraft")).unwrap(), "0.6.0");
             assert!(!mount.exists(), "the earlier install's image is still attached");
